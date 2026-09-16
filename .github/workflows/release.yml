@@ -1,0 +1,1304 @@
+# Churner release pipeline — the reusable half.
+#
+# A customer calls this from a thin workflow of their own (see README.md),
+# dispatched by hand from the Actions tab (or from the Build tab's own
+# buttons, which drive the same `workflow_dispatch`). It drives a release's
+# whole lifecycle — cut a candidate, promote it to production, or roll
+# production back — across the TWO environments the Churner environment stack
+# created for it (`infrastructure/customer/environment-stack/`), and reports
+# every outcome to Churner through the internal deployment-event route.
+#
+# ## Two environments, one artefact
+#
+# `rc` and `production` are SEPARATE created environments (design spec
+# §7.2/§7.4): each has its own host, its own database, its own ECR repository
+# and its own deployer role. That separation is the point of a release
+# pipeline — the candidate has to land somewhere that is not production.
+#
+#   cut-rc    builds the commit on RC's CodeBuild project, pushes `rc-<sha>`
+#             to RC's repository, and deploys it on the RC HOST. It assumes
+#             `rc-role-arn` and can reach nothing in production.
+#   promote   reads what is actually running on the RC host, refuses unless
+#             its short sha matches `confirm-short-sha`, COPIES that exact
+#             image into production's repository as `prod-<sha>`, and deploys
+#             it on the PRODUCTION host. It assumes `role-arn`.
+#   rollback  redeploys a named tag on the production host, under `role-arn`.
+#
+# The copy is a copy, not a retag: `ecr:PutImage` validates that a manifest's
+# layers already exist in the TARGET repository, so moving an image between
+# two repositories means moving its bytes (`scripts/copy-image.sh`).
+# Rebuilding from the same commit would be simpler and would promote a
+# DIFFERENT artefact, which is the one thing a promote must never do.
+#
+# `promote` and `rollback` carry a GitHub `environment:` gate, so a protection
+# rule holds them for approval; `cut-rc` carries none, because nothing it does
+# reaches a real user. A job bound to an environment presents
+# `repo:<owner>/<repo>:environment:<name>` as its OIDC subject — the trust
+# policy the environment stack renders admits that shape alongside the ref
+# one, which is what lets the gate and the role assume coexist.
+#
+# ## Everything it does, it does with the deployer roles' enumerated grants
+#
+#   codebuild:StartBuild               start the image build (cut-rc, rc role)
+#   codebuild:BatchGetBuilds           poll it to a terminal phase
+#   ecr:BatchGetImage                  read the source manifest (promote)
+#   ecr:GetDownloadUrlForLayer         read each blob it names
+#   ecr:BatchCheckLayerAvailability    skip blobs production already holds
+#   ecr:InitiateLayerUpload            \
+#   ecr:UploadLayerPart                 > write the missing ones
+#   ecr:CompleteLayerUpload            /
+#   ecr:PutImage                       write the manifest under its new tag
+#   ssm:DescribeInstanceInformation    find an environment host by tag
+#   ssm:SendCommand                    run the host script on it
+#   ssm:GetCommandInvocation           read that command's result BY ID
+#
+# and nothing else. A test derives every `aws codebuild|ssm|ecr` call this
+# file and `scripts/copy-image.sh` make, and asserts each is granted — by
+# ACTION and by the REPOSITORY it names — with `ecr:GetAuthorizationToken`
+# the one deliberate unused grant (docker authentication happens ON THE HOST,
+# under its own instance profile). The roles hold no `ListCommands` /
+# `ListCommandInvocations`: enumeration turns "read my own command" into "read
+# every command any principal ever sent", which a deploy that knows its own id
+# needs none of.
+#
+# ## Secrets never reach the runner
+#
+# The database master password and the application's own secrets are read ON
+# THE HOST, by the host's own instance profile, inside the script SSM runs.
+# This workflow passes the ARN of the database secret and the NAMES of the
+# application secrets; it never sees a value. The runner holds no application
+# credential at all.
+#
+# This file is authored in the churner monorepo under
+# `github-actions/release-workflow/`; `shared/tests/release-workflow.test.ts`
+# asserts its interface, its action pins and both script checksums.
+
+name: Churner release
+
+on:
+  workflow_call:
+    inputs:
+      project:
+        description: Churner project key, e.g. `MC`.
+        required: true
+        type: string
+      environment:
+        description: >-
+          The PRODUCTION environment, named as you named it in the wizard.
+          `promote` and `rollback` act on this one, and it is also the name of
+          the GitHub environment whose protection rules hold them for
+          approval.
+        required: false
+        type: string
+        default: production
+      rc-environment:
+        description: >-
+          The CANDIDATE environment, named as you named it in the wizard.
+          `cut-rc` builds and deploys here, and `promote` reads what is
+          running here before copying it to production.
+        required: false
+        type: string
+        default: rc
+      action:
+        description: One of `cut-rc`, `promote`, `rollback`.
+        required: true
+        type: string
+      role-arn:
+        description: >-
+          ARN of the PRODUCTION environment's deployer role,
+          `arn:aws:iam::<account>:role/churner-deployer-<projectKey>-<environment>`.
+          Assumed by `promote`, `rollback` and `list`.
+        required: true
+        type: string
+      rc-role-arn:
+        description: >-
+          ARN of the CANDIDATE environment's deployer role. Assumed by
+          `cut-rc`, and by the one step of `promote` that reads what the RC
+          host is running. It can reach nothing in production.
+        required: true
+        type: string
+      rc-codebuild-project:
+        description: >-
+          The candidate environment's CodeBuild project,
+          `churner-<projectKey>-<rc-environment>`. Read only by `cut-rc` — a
+          promote moves the image that project already built.
+        required: true
+        type: string
+      host-instance-id:
+        description: >-
+          OVERRIDE for the PRODUCTION host. Leave it empty: the host is found
+          by its `churner-environment-host=<environment>` tag, and the stack
+          creates exactly one, so a hand-copied id is a value that goes stale
+          the moment the host is replaced.
+        required: false
+        type: string
+        default: ''
+      rc-host-instance-id:
+        description: OVERRIDE for the candidate host. Same advice.
+        required: false
+        type: string
+        default: ''
+      aws-region:
+        description: Region both environment stacks live in.
+        required: true
+        type: string
+      image-tag:
+        description: >-
+          OVERRIDE for the tag `cut-rc` builds under. Leave it empty — the
+          default is `rc-<sha>`. Set it only for a deliberately out-of-band
+          build.
+        required: false
+        type: string
+        default: ''
+      sha:
+        description: >-
+          Commit to build (`cut-rc`). Leave it empty to use this run's own ref
+          head (`github.sha`).
+        required: false
+        type: string
+        default: ''
+      confirm-short-sha:
+        description: >-
+          `promote` only, and REQUIRED for it. The 7-character prefix of the
+          commit you mean to promote — checked against what is ACTUALLY
+          running on the candidate host before anything is copied, so a
+          promote can never ship a different build than the one the operator
+          looked at.
+        required: false
+        type: string
+        default: ''
+      target-tag:
+        description: >-
+          `rollback` only. The image tag to redeploy on the production host,
+          e.g. `production-prev-1787864281` (a host-local rollback point) or
+          any `prod-<sha>` still in the registry. Leave it EMPTY to run the
+          `list` job instead, which deploys nothing and prints the available
+          points to the run summary.
+        required: false
+        type: string
+        default: ''
+      health-path:
+        description: >-
+          Rooted path the readiness gate polls on the candidate release's own
+          port before it is swapped live. `/` at rest.
+        required: false
+        type: string
+        default: /
+      db-secret-arn:
+        description: >-
+          ARN of the PRODUCTION environment's RDS-managed master secret
+          (`ChurnerEnv<Name>DbSecretArn` in the stack's outputs). The host
+          reads it under its own instance profile and composes `DATABASE_URL`;
+          this workflow only names it. Empty for an environment with no
+          database.
+        required: false
+        type: string
+        default: ''
+      rc-db-secret-arn:
+        description: The candidate environment's own database secret ARN.
+        required: false
+        type: string
+        default: ''
+      secret-keys:
+        description: >-
+          Space-separated NAMES of the application secrets the PRODUCTION
+          release container needs, each read on that host from
+          `<its secrets prefix>/<NAME>` under its own instance profile. The
+          scaffolded caller renders this from `.churner/release/secrets` —
+          one name per line, `#` comments allowed. Names only: no secret
+          value ever reaches this workflow.
+        required: false
+        type: string
+        default: ''
+      rc-secret-keys:
+        description: >-
+          The same, for the CANDIDATE environment. LEAVE IT EMPTY and the
+          candidate gets `secret-keys` — the same NAMES, resolved on rc's own
+          host under rc's own prefix, which is what almost every project
+          wants. Set it only for the ASYMMETRIC case. The two are separate
+          inputs because an unreadable name is a deliberate hard failure on
+          the host, so one shared list would let a production-only secret
+          break the next `cut-rc` — a deploy to the candidate failing over a
+          name that has nothing to do with it. The scaffolded caller renders
+          this from `.churner/release/secrets.rc`, when the repository
+          carries one.
+        required: false
+        type: string
+        default: ''
+      tracker-url:
+        description: Base URL of your Churner instance. Must be https.
+        required: false
+        type: string
+        default: https://churner.ai
+      scripts-base-url:
+        description: >-
+          Where the host script (`host/deploy-release.sh`) and the promote's
+          image copier (`scripts/copy-image.sh`) are fetched from. A PINNED,
+          IMMUTABLE TAG on the PUBLIC `churner-ai/environment-stack`
+          repository, never a branch — the host runs what it fetches, as
+          root, and fetches it with an unauthenticated curl. It is the SAME
+          base URL the environment stack's own `bootstrap.sh` uses, so one
+          tag serves every artefact. Override it only if you vendor the
+          scripts, and re-pin their checksums with it.
+        required: false
+        type: string
+        default: https://raw.githubusercontent.com/churner-ai/environment-stack/refs/tags/v1
+    secrets:
+      tracker-token:
+        description: >-
+          Bearer token for `POST /api/internal/deployment-event`. Leave it
+          unset and every report step warns and skips — a missing token never
+          fails a deploy.
+        required: false
+
+# SHA-256 of the two scripts this workflow fetches, each verified before it
+# runs. Tests assert them against the files' actual bytes, so a script edited
+# without re-pinning fails CI rather than failing on a customer's host.
+env:
+  CHURNER_RELEASE_SCRIPT_SHA256: 76d01154cb73fff4c5e6ec4f743d7a9fc65b2c9b26104feccab855332224f5a5
+  CHURNER_COPY_SCRIPT_SHA256: 896afb7e002ae3c631109474e91061090a27d5eaec0c82c9555563228c74e323
+
+jobs:
+  cut-rc:
+    name: Cut RC
+    if: inputs.action == 'cut-rc'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # No `environment:` gate, deliberately: `cut-rc` builds and deploys on the
+    # CANDIDATE host only. Nothing it does reaches a real user, so holding it
+    # for approval would spend a reviewer on the one action that needs none.
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@796449b3e38e3c256861227399e58b780e0e5538 # v6
+        id: creds
+        with:
+          role-to-assume: ${{ inputs.rc-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: churner-release-cut-rc
+
+      - name: Resolve identifiers
+        id: ids
+        env:
+          PROJECT: ${{ inputs.project }}
+          ENVIRONMENT: ${{ inputs.rc-environment }}
+          INPUT_SHA: ${{ inputs.sha }}
+          INPUT_IMAGE_TAG: ${{ inputs.image-tag }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          ACCOUNT_ID: ${{ steps.creds.outputs.aws-account-id }}
+        run: |
+          set -euo pipefail
+          # `aws-region` reaches a registry host, which reaches the image URI,
+          # which reaches a command running as root on the host. It is the one
+          # value in this file that was shape-checked nowhere (fix-round-1
+          # review, N2).
+          case "$AWS_REGION" in
+            ''|*[!a-z0-9-]*) echo "::error::aws-region must be lowercase letters, digits and '-' (got '${AWS_REGION}')"; exit 1 ;;
+          esac
+          case "$ACCOUNT_ID" in
+            ''|*[!0-9]*) echo "::error::could not resolve a numeric AWS account id from the assumed role"; exit 1 ;;
+          esac
+          slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'; }
+          sha="${INPUT_SHA:-${GITHUB_SHA}}"
+          tag="${INPUT_IMAGE_TAG:-rc-${sha}}"
+          repo="churner-$(slug "$PROJECT")-$(slug "$ENVIRONMENT")"
+          image_uri="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repo}:${tag}"
+          {
+            echo "sha=${sha}"
+            echo "tag=${tag}"
+            echo "repo=${repo}"
+            echo "image-uri=${image_uri}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build the image
+        id: build
+        env:
+          CODEBUILD_PROJECT: ${{ inputs.rc-codebuild-project }}
+          HEAD_SHA: ${{ steps.ids.outputs.sha }}
+          IMAGE_TAG: ${{ steps.ids.outputs.tag }}
+        run: |
+          set -euo pipefail
+          build_id="$(
+            aws codebuild start-build \
+              --project-name "$CODEBUILD_PROJECT" \
+              --source-version "$HEAD_SHA" \
+              --environment-variables-override "name=IMAGE_TAG,value=${IMAGE_TAG},type=PLAINTEXT" \
+              --query 'build.id' --output text
+          )"
+          echo "Started CodeBuild ${build_id}"
+
+          status=IN_PROGRESS
+          # 120 x 15s = 30 minutes, past which a build is not slow, it is stuck.
+          for _ in $(seq 1 120); do
+            status="$(aws codebuild batch-get-builds --ids "$build_id" --query 'builds[0].buildStatus' --output text 2>/dev/null || printf 'IN_PROGRESS')"
+            [ "$status" = "IN_PROGRESS" ] || break
+            sleep 15
+          done
+
+          if [ "$status" != "SUCCEEDED" ]; then
+            echo "::error::CodeBuild finished ${status}"
+            exit 1
+          fi
+
+      # `if: success()`, not `always()`: the event schema carries no status
+      # field, so a report sent after a failed build is a row claiming a cut
+      # that did not happen. A failed run is already visible as a failed run —
+      # the Build tab reads the workflow run itself — and silence here keeps
+      # the recorded history true.
+      - name: Tell Churner (cut)
+        if: success()
+        continue-on-error: true
+        env:
+          TRACKER_TOKEN: ${{ secrets.tracker-token }}
+          TRACKER_URL: ${{ inputs.tracker-url }}
+          PROJECT: ${{ inputs.project }}
+          GIT_SHA: ${{ steps.ids.outputs.sha }}
+          IMAGE_TAG: ${{ steps.ids.outputs.tag }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$TRACKER_URL" in
+            https://*) ;;
+            *) echo "::warning::tracker-url must be https; not reporting this deploy"; exit 0 ;;
+          esac
+          if [ -z "$TRACKER_TOKEN" ]; then
+            echo "::warning::no tracker token configured; not reporting this deploy"
+            exit 0
+          fi
+          body="$(jq -nc \
+            --arg project "$PROJECT" \
+            --arg gitSha "$GIT_SHA" \
+            --arg imageTag "$IMAGE_TAG" \
+            --arg actor "$ACTOR" \
+            --arg workflowRunUrl "$RUN_URL" \
+            '{"project":$project,"env":"rc","eventType":"rc_cut","gitSha":$gitSha,"imageTag":$imageTag,"actor":$actor,"workflowRunUrl":$workflowRunUrl}')"
+          curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
+            -X POST "${TRACKER_URL}/api/internal/deployment-event" \
+            -H "Authorization: Bearer ${TRACKER_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d "$body" >/dev/null \
+            || echo "::warning::deployment-event POST failed (continuing — the deploy is not affected)"
+
+      - name: Find the candidate host
+        id: host
+        env:
+          ENVIRONMENT: ${{ inputs.rc-environment }}
+          HOST_INSTANCE_ID: ${{ inputs.rc-host-instance-id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$HOST_INSTANCE_ID" ]; then
+            instance_id="$HOST_INSTANCE_ID"
+          else
+            # SC2016: the backticks are JMESPath, and single quotes are what
+            # stop the shell from running `Online` as a command. Double
+            # quotes here would be the bug.
+            # shellcheck disable=SC2016
+            instance_id="$(
+              aws ssm describe-instance-information \
+                --filters "Key=tag:churner-environment-host,Values=${ENVIRONMENT}" \
+                --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
+                --output text
+            )"
+          fi
+          matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
+          if [ "$matches" != "1" ]; then
+            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT}, found ${matches}. Pass rc-host-instance-id to choose between several."
+            exit 1
+          fi
+          echo "instance-id=${instance_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy it on the candidate host
+        id: deploy
+        env:
+          IMAGE_URI: ${{ steps.ids.outputs.image-uri }}
+          TAG: ${{ steps.ids.outputs.tag }}
+          SHA: ${{ steps.ids.outputs.sha }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+          # The fallback is HERE, not on the input's own default: an empty
+          # `rc-secret-keys` means "the same names as production", not "no
+          # configuration at all". Defaulting the INPUT to empty would turn
+          # the asymmetric case from a loud hard failure on a name the host
+          # cannot read into a candidate container started with none of its
+          # secrets — which the host script's own header calls the worse of
+          # the two. The split stays available for the case that needs it.
+          SECRET_KEYS: ${{ inputs.rc-secret-keys != '' && inputs.rc-secret-keys || inputs.secret-keys }}
+          DB_SECRET_ARN: ${{ inputs.rc-db-secret-arn }}
+          SCRIPTS_BASE_URL: ${{ inputs.scripts-base-url }}
+          INSTANCE_ID: ${{ steps.host.outputs.instance-id }}
+        run: |
+          set -euo pipefail
+          # Every value below becomes a shell word inside a command that runs
+          # as ROOT on the host. They arrive from a workflow this repository's
+          # own branch protections gate — trusted — and are shape-checked
+          # anyway, because "trusted" is a statement about intent and a quote
+          # in one of them is what turns a typo into a command.
+          case "$SCRIPTS_BASE_URL" in
+            https://*) ;;
+            *) echo "::error::scripts-base-url must be https — the host runs what it fetches, as root"; exit 1 ;;
+          esac
+          case "$SCRIPTS_BASE_URL" in
+            *[!A-Za-z0-9._/:-]*) echo "::error::scripts-base-url contains a character a URL of this shape cannot hold"; exit 1 ;;
+          esac
+          case "$TAG" in
+            ''|*[!A-Za-z0-9._-]*) echo "::error::image-tag must be letters, digits, '.', '_' or '-' (got '${TAG}')"; exit 1 ;;
+          esac
+          case "$SHA" in
+            ''|*[!A-Za-z0-9]*) echo "::error::sha must be alphanumeric (got '${SHA}')"; exit 1 ;;
+          esac
+          case "$IMAGE_URI" in
+            *[!A-Za-z0-9._/:-]*) echo "::error::refusing an unusable image reference (got '${IMAGE_URI}')"; exit 1 ;;
+          esac
+          case "$HEALTH_PATH" in
+            /*) ;;
+            *) echo "::error::health-path must start with '/' (got '${HEALTH_PATH}')"; exit 1 ;;
+          esac
+          case "$HEALTH_PATH" in
+            *[!A-Za-z0-9._~/-]*) echo "::error::health-path contains a character a URL path cannot hold"; exit 1 ;;
+          esac
+          case "$DB_SECRET_ARN" in
+            ''|arn:*) ;;
+            *) echo "::error::rc-db-secret-arn must be a Secrets Manager ARN (got '${DB_SECRET_ARN}')"; exit 1 ;;
+          esac
+          case "$DB_SECRET_ARN" in
+            *[!A-Za-z0-9:/_+=.@!-]*) echo "::error::rc-db-secret-arn contains a character an ARN cannot hold"; exit 1 ;;
+          esac
+          # Space-separated names. Squashing the separators first is how a
+          # bracket expression checks a list without having to express "a
+          # space" inside one.
+          case "$(printf '%s' "$SECRET_KEYS" | tr -d ' ')" in
+            *[!A-Za-z0-9_]*) echo "::error::secret-keys must be space-separated environment-variable names"; exit 1 ;;
+          esac
+
+          remote="$(cat <<REMOTE
+          set -euo pipefail
+          export CHURNER_IMAGE_URI='${IMAGE_URI}'
+          export CHURNER_TAG='${TAG}'
+          export CHURNER_SHA='${SHA}'
+          export CHURNER_SECRET_KEYS='${SECRET_KEYS}'
+          export CHURNER_DB_SECRET_ARN='${DB_SECRET_ARN}'
+          export CHURNER_HEALTH_PATH='${HEALTH_PATH}'
+          script="\$(mktemp)"
+          trap 'rm -f "\$script"' EXIT
+          curl -fsSL '${SCRIPTS_BASE_URL}/host/deploy-release.sh' -o "\$script"
+          echo '${CHURNER_RELEASE_SCRIPT_SHA256}  '"\$script" | sha256sum -c -
+          bash "\$script"
+          REMOTE
+          )"
+
+          jq -n --arg s "$remote" '{commands: [$s]}' > "${RUNNER_TEMP}/ssm.json"
+
+          command_id="$(
+            aws ssm send-command \
+              --document-name AWS-RunShellScript \
+              --instance-ids "$INSTANCE_ID" \
+              --timeout-seconds 600 \
+              --comment "churner release cut-rc ${TAG}" \
+              --parameters "file://${RUNNER_TEMP}/ssm.json" \
+              --query 'Command.CommandId' --output text
+          )"
+          echo "Sent ${command_id}"
+
+          state=Pending
+          for _ in $(seq 1 120); do
+            state="$(
+              aws ssm get-command-invocation \
+                --command-id "$command_id" \
+                --instance-id "$INSTANCE_ID" \
+                --query 'Status' --output text 2>/dev/null || printf 'Pending'
+            )"
+            case "$state" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 5
+          done
+
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text 2>/dev/null || true
+          if [ "$state" != "Success" ]; then
+            echo "::error::the host reported ${state} for the deploy command"
+            exit 1
+          fi
+
+      - name: Tell Churner (deploy)
+        if: success()
+        continue-on-error: true
+        env:
+          TRACKER_TOKEN: ${{ secrets.tracker-token }}
+          TRACKER_URL: ${{ inputs.tracker-url }}
+          PROJECT: ${{ inputs.project }}
+          GIT_SHA: ${{ steps.ids.outputs.sha }}
+          IMAGE_TAG: ${{ steps.ids.outputs.tag }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$TRACKER_URL" in
+            https://*) ;;
+            *) echo "::warning::tracker-url must be https; not reporting this deploy"; exit 0 ;;
+          esac
+          if [ -z "$TRACKER_TOKEN" ]; then
+            echo "::warning::no tracker token configured; not reporting this deploy"
+            exit 0
+          fi
+          body="$(jq -nc \
+            --arg project "$PROJECT" \
+            --arg gitSha "$GIT_SHA" \
+            --arg imageTag "$IMAGE_TAG" \
+            --arg actor "$ACTOR" \
+            --arg workflowRunUrl "$RUN_URL" \
+            '{"project":$project,"env":"rc","eventType":"rc_deploy","gitSha":$gitSha,"imageTag":$imageTag,"actor":$actor,"workflowRunUrl":$workflowRunUrl}')"
+          curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
+            -X POST "${TRACKER_URL}/api/internal/deployment-event" \
+            -H "Authorization: Bearer ${TRACKER_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d "$body" >/dev/null \
+            || echo "::warning::deployment-event POST failed (continuing — the deploy is not affected)"
+
+  promote:
+    name: Promote
+    if: inputs.action == 'promote'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Holds THIS job for GitHub's own approval gate — the Build tab renders a
+    # `waiting` run as "Waiting for approval…", never as failure. Named after
+    # the production environment, so the protection rules live where an
+    # operator already thinks of production. The stack's trust policy admits
+    # the `:environment:` subject a gated job presents.
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      # FIRST under the CANDIDATE's role: everything up to and including
+      # "what is running on rc" is a question about rc, and production's role
+      # cannot reach rc's host at all.
+      - uses: aws-actions/configure-aws-credentials@796449b3e38e3c256861227399e58b780e0e5538 # v6
+        id: rc-creds
+        with:
+          role-to-assume: ${{ inputs.rc-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: churner-release-promote-read-rc
+
+      - name: Resolve identifiers
+        id: ids
+        env:
+          PROJECT: ${{ inputs.project }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          RC_ENVIRONMENT: ${{ inputs.rc-environment }}
+        run: |
+          set -euo pipefail
+          slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'; }
+          {
+            echo "repo=churner-$(slug "$PROJECT")-$(slug "$ENVIRONMENT")"
+            echo "rc-repo=churner-$(slug "$PROJECT")-$(slug "$RC_ENVIRONMENT")"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Find the candidate host
+        id: rc-host
+        env:
+          ENVIRONMENT: ${{ inputs.rc-environment }}
+          HOST_INSTANCE_ID: ${{ inputs.rc-host-instance-id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$HOST_INSTANCE_ID" ]; then
+            instance_id="$HOST_INSTANCE_ID"
+          else
+            # shellcheck disable=SC2016
+            instance_id="$(
+              aws ssm describe-instance-information \
+                --filters "Key=tag:churner-environment-host,Values=${ENVIRONMENT}" \
+                --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
+                --output text
+            )"
+          fi
+          matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
+          if [ "$matches" != "1" ]; then
+            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT}, found ${matches}. Pass rc-host-instance-id to choose between several."
+            exit 1
+          fi
+          echo "instance-id=${instance_id}" >> "$GITHUB_OUTPUT"
+
+      # Reads what is ACTUALLY running on the candidate host, so a promote can
+      # never ship a different build than the one an operator looked at before
+      # approving the environment gate above.
+      - name: Verify what is running on the candidate
+        id: running
+        env:
+          RC_ENVIRONMENT: ${{ inputs.rc-environment }}
+          CONFIRM_SHORT_SHA: ${{ inputs.confirm-short-sha }}
+          INSTANCE_ID: ${{ steps.rc-host.outputs.instance-id }}
+        run: |
+          set -euo pipefail
+          [ -n "$CONFIRM_SHORT_SHA" ] || { echo "::error::confirm-short-sha is required for promote"; exit 1; }
+          case "$CONFIRM_SHORT_SHA" in
+            *[!A-Za-z0-9]*) echo "::error::confirm-short-sha must be alphanumeric (got '${CONFIRM_SHORT_SHA}')"; exit 1 ;;
+          esac
+          case "$RC_ENVIRONMENT" in
+            ''|*[!A-Za-z0-9._-]*) echo "::error::rc-environment must be letters, digits, '.', '_' or '-' (got '${RC_ENVIRONMENT}')"; exit 1 ;;
+          esac
+
+          remote="set -euo pipefail
+          docker inspect --format '{{ index .Config.Labels \"churner.release.tag\" }} {{ index .Config.Labels \"churner.release.sha\" }}' churner-release-${RC_ENVIRONMENT}"
+
+          jq -n --arg s "$remote" '{commands: [$s]}' > "${RUNNER_TEMP}/ssm-inspect.json"
+
+          command_id="$(
+            aws ssm send-command \
+              --document-name AWS-RunShellScript \
+              --instance-ids "$INSTANCE_ID" \
+              --timeout-seconds 60 \
+              --comment "churner release promote inspect ${RC_ENVIRONMENT}" \
+              --parameters "file://${RUNNER_TEMP}/ssm-inspect.json" \
+              --query 'Command.CommandId' --output text
+          )"
+
+          state=Pending
+          for _ in $(seq 1 30); do
+            state="$(
+              aws ssm get-command-invocation \
+                --command-id "$command_id" \
+                --instance-id "$INSTANCE_ID" \
+                --query 'Status' --output text 2>/dev/null || printf 'Pending'
+            )"
+            case "$state" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 2
+          done
+          [ "$state" = "Success" ] || { echo "::error::could not read what is currently running on ${RC_ENVIRONMENT} (${state})"; exit 1; }
+
+          out="$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text)"
+          running_tag="$(printf '%s' "$out" | awk '{print $1}')"
+          running_sha="$(printf '%s' "$out" | awk '{print $2}')"
+          running_short="$(printf '%s' "$running_sha" | cut -c1-7)"
+          if [ "$running_short" != "$CONFIRM_SHORT_SHA" ]; then
+            echo "::error::confirm-short-sha (${CONFIRM_SHORT_SHA}) does not match what is running on ${RC_ENVIRONMENT} (${running_short}). Nothing was promoted."
+            exit 1
+          fi
+          case "$running_tag" in
+            ''|*[!A-Za-z0-9._-]*) echo "::error::the candidate host reports an unusable image tag ('${running_tag}')"; exit 1 ;;
+          esac
+          {
+            echo "running-tag=${running_tag}"
+            echo "running-sha=${running_sha}"
+          } >> "$GITHUB_OUTPUT"
+
+      # From here on, PRODUCTION's role: the copy reads rc's repository (the
+      # one cross-environment grant the module renders) and writes
+      # production's, and the deploy reaches production's host.
+
+      # Cleared BEFORE the second assume, so that assume is a fresh OIDC
+      # exchange rather than the candidate's session assuming production's
+      # role. The trust policy admits `sts:AssumeRoleWithWebIdentity` and
+      # nothing else, so a chained assume would be denied — and this is one
+      # line, where discovering the behaviour on a customer's promote is a
+      # failed production deploy.
+      - name: Clear the candidate's credentials
+        run: |
+          set -euo pipefail
+          {
+            echo "AWS_ACCESS_KEY_ID="
+            echo "AWS_SECRET_ACCESS_KEY="
+            echo "AWS_SESSION_TOKEN="
+          } >> "$GITHUB_ENV"
+
+      - uses: aws-actions/configure-aws-credentials@796449b3e38e3c256861227399e58b780e0e5538 # v6
+        id: creds
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: churner-release-promote
+
+      - name: Copy the image into production
+        id: copy
+        env:
+          SOURCE_REPO: ${{ steps.ids.outputs.rc-repo }}
+          SOURCE_TAG: ${{ steps.running.outputs.running-tag }}
+          TARGET_REPO: ${{ steps.ids.outputs.repo }}
+          SHA: ${{ steps.running.outputs.running-sha }}
+          SCRIPTS_BASE_URL: ${{ inputs.scripts-base-url }}
+        run: |
+          set -euo pipefail
+          case "$SCRIPTS_BASE_URL" in
+            https://*) ;;
+            *) echo "::error::scripts-base-url must be https — the host runs what it fetches, as root"; exit 1 ;;
+          esac
+          case "$SHA" in
+            ''|*[!A-Za-z0-9]*) echo "::error::the candidate host reports an unusable sha ('${SHA}')"; exit 1 ;;
+          esac
+          target_tag="prod-${SHA}"
+
+          # Fetched and checksum-verified exactly like the host script, and
+          # for the same reason: it is a program, so it lives in a file a test
+          # can execute rather than in shell buried in YAML.
+          script="$(mktemp)"
+          trap 'rm -f "$script"' EXIT
+          curl -fsSL "${SCRIPTS_BASE_URL}/scripts/copy-image.sh" -o "$script"
+          echo "${CHURNER_COPY_SCRIPT_SHA256}  ${script}" | sha256sum -c -
+
+          CHURNER_SOURCE_REPOSITORY="$SOURCE_REPO" \
+          CHURNER_SOURCE_TAG="$SOURCE_TAG" \
+          CHURNER_TARGET_REPOSITORY="$TARGET_REPO" \
+          CHURNER_TARGET_TAG="$target_tag" \
+          bash "$script"
+
+          echo "tag=${target_tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Tell Churner (promote)
+        if: success()
+        continue-on-error: true
+        env:
+          TRACKER_TOKEN: ${{ secrets.tracker-token }}
+          TRACKER_URL: ${{ inputs.tracker-url }}
+          PROJECT: ${{ inputs.project }}
+          GIT_SHA: ${{ steps.running.outputs.running-sha }}
+          IMAGE_TAG: ${{ steps.copy.outputs.tag }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$TRACKER_URL" in
+            https://*) ;;
+            *) echo "::warning::tracker-url must be https; not reporting this deploy"; exit 0 ;;
+          esac
+          if [ -z "$TRACKER_TOKEN" ]; then
+            echo "::warning::no tracker token configured; not reporting this deploy"
+            exit 0
+          fi
+          body="$(jq -nc \
+            --arg project "$PROJECT" \
+            --arg gitSha "$GIT_SHA" \
+            --arg imageTag "$IMAGE_TAG" \
+            --arg actor "$ACTOR" \
+            --arg workflowRunUrl "$RUN_URL" \
+            '{"project":$project,"env":"prod","eventType":"prod_promote","gitSha":$gitSha,"imageTag":$imageTag,"actor":$actor,"workflowRunUrl":$workflowRunUrl}')"
+          curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
+            -X POST "${TRACKER_URL}/api/internal/deployment-event" \
+            -H "Authorization: Bearer ${TRACKER_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d "$body" >/dev/null \
+            || echo "::warning::deployment-event POST failed (continuing — the deploy is not affected)"
+
+      - name: Find the production host
+        id: host
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$HOST_INSTANCE_ID" ]; then
+            instance_id="$HOST_INSTANCE_ID"
+          else
+            # shellcheck disable=SC2016
+            instance_id="$(
+              aws ssm describe-instance-information \
+                --filters "Key=tag:churner-environment-host,Values=${ENVIRONMENT}" \
+                --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
+                --output text
+            )"
+          fi
+          matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
+          if [ "$matches" != "1" ]; then
+            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT}, found ${matches}. Pass host-instance-id to choose between several."
+            exit 1
+          fi
+          echo "instance-id=${instance_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy it on the production host
+        id: deploy
+        env:
+          ACCOUNT_ID: ${{ steps.creds.outputs.aws-account-id }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          REPO: ${{ steps.ids.outputs.repo }}
+          TAG: ${{ steps.copy.outputs.tag }}
+          SHA: ${{ steps.running.outputs.running-sha }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+          SECRET_KEYS: ${{ inputs.secret-keys }}
+          DB_SECRET_ARN: ${{ inputs.db-secret-arn }}
+          SCRIPTS_BASE_URL: ${{ inputs.scripts-base-url }}
+          INSTANCE_ID: ${{ steps.host.outputs.instance-id }}
+        run: |
+          set -euo pipefail
+          case "$SCRIPTS_BASE_URL" in
+            https://*) ;;
+            *) echo "::error::scripts-base-url must be https — the host runs what it fetches, as root"; exit 1 ;;
+          esac
+          case "$SCRIPTS_BASE_URL" in
+            *[!A-Za-z0-9._/:-]*) echo "::error::scripts-base-url contains a character a URL of this shape cannot hold"; exit 1 ;;
+          esac
+          case "$TAG" in
+            ''|*[!A-Za-z0-9._-]*) echo "::error::image-tag must be letters, digits, '.', '_' or '-' (got '${TAG}')"; exit 1 ;;
+          esac
+          case "$SHA" in
+            ''|*[!A-Za-z0-9]*) echo "::error::sha must be alphanumeric (got '${SHA}')"; exit 1 ;;
+          esac
+          case "$HEALTH_PATH" in
+            /*) ;;
+            *) echo "::error::health-path must start with '/' (got '${HEALTH_PATH}')"; exit 1 ;;
+          esac
+          case "$HEALTH_PATH" in
+            *[!A-Za-z0-9._~/-]*) echo "::error::health-path contains a character a URL path cannot hold"; exit 1 ;;
+          esac
+          case "$DB_SECRET_ARN" in
+            ''|arn:*) ;;
+            *) echo "::error::db-secret-arn must be a Secrets Manager ARN (got '${DB_SECRET_ARN}')"; exit 1 ;;
+          esac
+          case "$DB_SECRET_ARN" in
+            *[!A-Za-z0-9:/_+=.@!-]*) echo "::error::db-secret-arn contains a character an ARN cannot hold"; exit 1 ;;
+          esac
+          case "$(printf '%s' "$SECRET_KEYS" | tr -d ' ')" in
+            *[!A-Za-z0-9_]*) echo "::error::secret-keys must be space-separated environment-variable names"; exit 1 ;;
+          esac
+          case "$AWS_REGION" in
+            ''|*[!a-z0-9-]*) echo "::error::aws-region must be lowercase letters, digits and '-' (got '${AWS_REGION}')"; exit 1 ;;
+          esac
+          case "$ACCOUNT_ID" in
+            ''|*[!0-9]*) echo "::error::could not resolve a numeric AWS account id from the assumed role"; exit 1 ;;
+          esac
+          image_uri="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${REPO}:${TAG}"
+          # The COMPOSED value, checked after composing it: `cut-rc` guarded
+          # its own image URI and these two did not, though the string lands
+          # in the same root-run command on the production host
+          # (fix-round-1 review, N2).
+          case "$image_uri" in
+            *[!A-Za-z0-9._/:-]*) echo "::error::refusing an unusable image reference (got '${image_uri}')"; exit 1 ;;
+          esac
+
+          remote="$(cat <<REMOTE
+          set -euo pipefail
+          export CHURNER_IMAGE_URI='${image_uri}'
+          export CHURNER_TAG='${TAG}'
+          export CHURNER_SHA='${SHA}'
+          export CHURNER_SECRET_KEYS='${SECRET_KEYS}'
+          export CHURNER_DB_SECRET_ARN='${DB_SECRET_ARN}'
+          export CHURNER_HEALTH_PATH='${HEALTH_PATH}'
+          script="\$(mktemp)"
+          trap 'rm -f "\$script"' EXIT
+          curl -fsSL '${SCRIPTS_BASE_URL}/host/deploy-release.sh' -o "\$script"
+          echo '${CHURNER_RELEASE_SCRIPT_SHA256}  '"\$script" | sha256sum -c -
+          bash "\$script"
+          REMOTE
+          )"
+
+          jq -n --arg s "$remote" '{commands: [$s]}' > "${RUNNER_TEMP}/ssm.json"
+
+          command_id="$(
+            aws ssm send-command \
+              --document-name AWS-RunShellScript \
+              --instance-ids "$INSTANCE_ID" \
+              --timeout-seconds 600 \
+              --comment "churner release promote ${TAG}" \
+              --parameters "file://${RUNNER_TEMP}/ssm.json" \
+              --query 'Command.CommandId' --output text
+          )"
+
+          state=Pending
+          for _ in $(seq 1 120); do
+            state="$(
+              aws ssm get-command-invocation \
+                --command-id "$command_id" \
+                --instance-id "$INSTANCE_ID" \
+                --query 'Status' --output text 2>/dev/null || printf 'Pending'
+            )"
+            case "$state" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 5
+          done
+
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text 2>/dev/null || true
+          if [ "$state" != "Success" ]; then
+            echo "::error::the host reported ${state} for the deploy command"
+            exit 1
+          fi
+
+      - name: Tell Churner (deploy)
+        if: success()
+        continue-on-error: true
+        env:
+          TRACKER_TOKEN: ${{ secrets.tracker-token }}
+          TRACKER_URL: ${{ inputs.tracker-url }}
+          PROJECT: ${{ inputs.project }}
+          GIT_SHA: ${{ steps.running.outputs.running-sha }}
+          IMAGE_TAG: ${{ steps.copy.outputs.tag }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$TRACKER_URL" in
+            https://*) ;;
+            *) echo "::warning::tracker-url must be https; not reporting this deploy"; exit 0 ;;
+          esac
+          if [ -z "$TRACKER_TOKEN" ]; then
+            echo "::warning::no tracker token configured; not reporting this deploy"
+            exit 0
+          fi
+          body="$(jq -nc \
+            --arg project "$PROJECT" \
+            --arg gitSha "$GIT_SHA" \
+            --arg imageTag "$IMAGE_TAG" \
+            --arg actor "$ACTOR" \
+            --arg workflowRunUrl "$RUN_URL" \
+            '{"project":$project,"env":"prod","eventType":"prod_deploy","gitSha":$gitSha,"imageTag":$imageTag,"actor":$actor,"workflowRunUrl":$workflowRunUrl}')"
+          curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
+            -X POST "${TRACKER_URL}/api/internal/deployment-event" \
+            -H "Authorization: Bearer ${TRACKER_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d "$body" >/dev/null \
+            || echo "::warning::deployment-event POST failed (continuing — the deploy is not affected)"
+
+  rollback:
+    name: Rollback
+    if: inputs.action == 'rollback' && inputs.target-tag != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Same gate as promote, and for the same reason — a rollback is a
+    # production deploy.
+    environment:
+      name: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@796449b3e38e3c256861227399e58b780e0e5538 # v6
+        id: creds
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: churner-release-rollback
+
+      - name: Resolve identifiers
+        id: ids
+        env:
+          PROJECT: ${{ inputs.project }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          ACCOUNT_ID: ${{ steps.creds.outputs.aws-account-id }}
+        run: |
+          set -euo pipefail
+          # `aws-region` reaches a registry host, which reaches the image URI,
+          # which reaches a command running as root on the host. It is the one
+          # value in this file that was shape-checked nowhere (fix-round-1
+          # review, N2).
+          case "$AWS_REGION" in
+            ''|*[!a-z0-9-]*) echo "::error::aws-region must be lowercase letters, digits and '-' (got '${AWS_REGION}')"; exit 1 ;;
+          esac
+          case "$ACCOUNT_ID" in
+            ''|*[!0-9]*) echo "::error::could not resolve a numeric AWS account id from the assumed role"; exit 1 ;;
+          esac
+          slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'; }
+          repo="churner-$(slug "$PROJECT")-$(slug "$ENVIRONMENT")"
+          registry="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          {
+            echo "repo=${repo}"
+            echo "registry=${registry}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Find the production host
+        id: host
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$HOST_INSTANCE_ID" ]; then
+            instance_id="$HOST_INSTANCE_ID"
+          else
+            # shellcheck disable=SC2016
+            instance_id="$(
+              aws ssm describe-instance-information \
+                --filters "Key=tag:churner-environment-host,Values=${ENVIRONMENT}" \
+                --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
+                --output text
+            )"
+          fi
+          matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
+          if [ "$matches" != "1" ]; then
+            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT}, found ${matches}. Pass host-instance-id to choose between several."
+            exit 1
+          fi
+          echo "instance-id=${instance_id}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy the target tag
+        id: deploy
+        env:
+          REGISTRY: ${{ steps.ids.outputs.registry }}
+          REPO: ${{ steps.ids.outputs.repo }}
+          TAG: ${{ inputs.target-tag }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+          SECRET_KEYS: ${{ inputs.secret-keys }}
+          DB_SECRET_ARN: ${{ inputs.db-secret-arn }}
+          SCRIPTS_BASE_URL: ${{ inputs.scripts-base-url }}
+          INSTANCE_ID: ${{ steps.host.outputs.instance-id }}
+        run: |
+          set -euo pipefail
+          case "$SCRIPTS_BASE_URL" in
+            https://*) ;;
+            *) echo "::error::scripts-base-url must be https — the host runs what it fetches, as root"; exit 1 ;;
+          esac
+          case "$SCRIPTS_BASE_URL" in
+            *[!A-Za-z0-9._/:-]*) echo "::error::scripts-base-url contains a character a URL of this shape cannot hold"; exit 1 ;;
+          esac
+          # A rollback target names an image IN THIS ENVIRONMENT'S OWN
+          # repository: the URI below is composed from the repository this job
+          # derived, never from anything the caller typed, so a tag can only
+          # ever select within it. Its SHAPE is checked here because it
+          # becomes a shell word on the host; whether it EXISTS is settled
+          # there, by a pull that fails and a local image that either is or is
+          # not present.
+          case "$TAG" in
+            ''|*[!A-Za-z0-9._-]*) echo "::error::target-tag must be letters, digits, '.', '_' or '-' (got '${TAG}')"; exit 1 ;;
+          esac
+          case "$HEALTH_PATH" in
+            /*) ;;
+            *) echo "::error::health-path must start with '/' (got '${HEALTH_PATH}')"; exit 1 ;;
+          esac
+          case "$HEALTH_PATH" in
+            *[!A-Za-z0-9._~/-]*) echo "::error::health-path contains a character a URL path cannot hold"; exit 1 ;;
+          esac
+          case "$DB_SECRET_ARN" in
+            ''|arn:*) ;;
+            *) echo "::error::db-secret-arn must be a Secrets Manager ARN (got '${DB_SECRET_ARN}')"; exit 1 ;;
+          esac
+          case "$DB_SECRET_ARN" in
+            *[!A-Za-z0-9:/_+=.@!-]*) echo "::error::db-secret-arn contains a character an ARN cannot hold"; exit 1 ;;
+          esac
+          case "$(printf '%s' "$SECRET_KEYS" | tr -d ' ')" in
+            *[!A-Za-z0-9_]*) echo "::error::secret-keys must be space-separated environment-variable names"; exit 1 ;;
+          esac
+          image_uri="${REGISTRY}/${REPO}:${TAG}"
+          # The COMPOSED value, checked after composing it: `cut-rc` guarded
+          # its own image URI and this one did not, though the string lands in
+          # the same root-run command on the production host (fix-round-1
+          # review, N2). `REGISTRY` is built in this job's `Resolve
+          # identifiers` step, where the region it embeds is guarded.
+          case "$image_uri" in
+            *[!A-Za-z0-9._/:-]*) echo "::error::refusing an unusable image reference (got '${image_uri}')"; exit 1 ;;
+          esac
+
+          # A host-local rollback point carries no git sha of its own;
+          # `deploy-release.sh` falls back to the tag itself for its container
+          # labels rather than being handed a fabricated one.
+          remote="$(cat <<REMOTE
+          set -euo pipefail
+          export CHURNER_IMAGE_URI='${image_uri}'
+          export CHURNER_TAG='${TAG}'
+          export CHURNER_SHA=''
+          export CHURNER_SECRET_KEYS='${SECRET_KEYS}'
+          export CHURNER_DB_SECRET_ARN='${DB_SECRET_ARN}'
+          export CHURNER_HEALTH_PATH='${HEALTH_PATH}'
+          script="\$(mktemp)"
+          trap 'rm -f "\$script"' EXIT
+          curl -fsSL '${SCRIPTS_BASE_URL}/host/deploy-release.sh' -o "\$script"
+          echo '${CHURNER_RELEASE_SCRIPT_SHA256}  '"\$script" | sha256sum -c -
+          bash "\$script"
+          REMOTE
+          )"
+
+          jq -n --arg s "$remote" '{commands: [$s]}' > "${RUNNER_TEMP}/ssm.json"
+
+          command_id="$(
+            aws ssm send-command \
+              --document-name AWS-RunShellScript \
+              --instance-ids "$INSTANCE_ID" \
+              --timeout-seconds 600 \
+              --comment "churner release rollback ${TAG}" \
+              --parameters "file://${RUNNER_TEMP}/ssm.json" \
+              --query 'Command.CommandId' --output text
+          )"
+
+          state=Pending
+          for _ in $(seq 1 120); do
+            state="$(
+              aws ssm get-command-invocation \
+                --command-id "$command_id" \
+                --instance-id "$INSTANCE_ID" \
+                --query 'Status' --output text 2>/dev/null || printf 'Pending'
+            )"
+            case "$state" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 5
+          done
+
+          aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" \
+            --query 'StandardOutputContent' --output text 2>/dev/null || true
+          if [ "$state" != "Success" ]; then
+            echo "::error::the host reported ${state} for the rollback command"
+            exit 1
+          fi
+
+      - name: Tell Churner
+        if: success()
+        continue-on-error: true
+        env:
+          TRACKER_TOKEN: ${{ secrets.tracker-token }}
+          TRACKER_URL: ${{ inputs.tracker-url }}
+          PROJECT: ${{ inputs.project }}
+          IMAGE_TAG: ${{ inputs.target-tag }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          case "$TRACKER_URL" in
+            https://*) ;;
+            *) echo "::warning::tracker-url must be https; not reporting this deploy"; exit 0 ;;
+          esac
+          if [ -z "$TRACKER_TOKEN" ]; then
+            echo "::warning::no tracker token configured; not reporting this deploy"
+            exit 0
+          fi
+          body="$(jq -nc \
+            --arg project "$PROJECT" \
+            --arg imageTag "$IMAGE_TAG" \
+            --arg actor "$ACTOR" \
+            --arg workflowRunUrl "$RUN_URL" \
+            '{"project":$project,"env":"prod","eventType":"rollback","imageTag":$imageTag,"actor":$actor,"workflowRunUrl":$workflowRunUrl}')"
+          curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
+            -X POST "${TRACKER_URL}/api/internal/deployment-event" \
+            -H "Authorization: Bearer ${TRACKER_TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d "$body" >/dev/null \
+            || echo "::warning::deployment-event POST failed (continuing — the deploy is not affected)"
+
+  # No `target-tag` means "show me what I could roll back to" — it deploys
+  # NOTHING, and carries NO environment gate: spending an approval on a
+  # read-only listing teaches an operator to click through the gate that
+  # matters.
+  list:
+    name: List rollback points
+    if: inputs.action == 'rollback' && inputs.target-tag == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@796449b3e38e3c256861227399e58b780e0e5538 # v6
+        id: creds
+        with:
+          role-to-assume: ${{ inputs.role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+          role-session-name: churner-release-list
+
+      - name: Resolve identifiers
+        id: ids
+        env:
+          PROJECT: ${{ inputs.project }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          AWS_REGION: ${{ inputs.aws-region }}
+          ACCOUNT_ID: ${{ steps.creds.outputs.aws-account-id }}
+        run: |
+          set -euo pipefail
+          # `aws-region` reaches a registry host, which reaches the image URI,
+          # which reaches a command running as root on the host. It is the one
+          # value in this file that was shape-checked nowhere (fix-round-1
+          # review, N2).
+          case "$AWS_REGION" in
+            ''|*[!a-z0-9-]*) echo "::error::aws-region must be lowercase letters, digits and '-' (got '${AWS_REGION}')"; exit 1 ;;
+          esac
+          case "$ACCOUNT_ID" in
+            ''|*[!0-9]*) echo "::error::could not resolve a numeric AWS account id from the assumed role"; exit 1 ;;
+          esac
+          slug() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'; }
+          repo="churner-$(slug "$PROJECT")-$(slug "$ENVIRONMENT")"
+          registry="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+          {
+            echo "repo=${repo}"
+            echo "registry=${registry}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Find the production host
+        id: host
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
+        run: |
+          set -euo pipefail
+          if [ -n "$HOST_INSTANCE_ID" ]; then
+            instance_id="$HOST_INSTANCE_ID"
+          else
+            # shellcheck disable=SC2016
+            instance_id="$(
+              aws ssm describe-instance-information \
+                --filters "Key=tag:churner-environment-host,Values=${ENVIRONMENT}" \
+                --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
+                --output text
+            )"
+          fi
+          matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
+          if [ "$matches" != "1" ]; then
+            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT}, found ${matches}. Pass host-instance-id to choose between several."
+            exit 1
+          fi
+          echo "instance-id=${instance_id}" >> "$GITHUB_OUTPUT"
+
+      - name: List available rollback points
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          REGISTRY: ${{ steps.ids.outputs.registry }}
+          REPO: ${{ steps.ids.outputs.repo }}
+          INSTANCE_ID: ${{ steps.host.outputs.instance-id }}
+        run: |
+          set -euo pipefail
+          case "$ENVIRONMENT" in
+            ''|*[!A-Za-z0-9._-]*) echo "::error::environment must be letters, digits, '.', '_' or '-' (got '${ENVIRONMENT}')"; exit 1 ;;
+          esac
+          # Read straight off the host's own image list — a rollback point is
+          # a local tag `deploy-release.sh` makes on the outgoing image right
+          # before removing the container it replaced. SCOPED TO THIS
+          # ENVIRONMENT'S OWN REPOSITORY: an unscoped `grep -- '-prev-'` would
+          # surface a tag belonging to any repository the host has ever
+          # pulled, and offer it as something to deploy here. No new AWS
+          # grant: `ssm:SendCommand` + `ssm:GetCommandInvocation`, both
+          # already counted.
+          remote="docker images --format '{{.Repository}}:{{.Tag}}' | grep \"^${REGISTRY}/${REPO}:${ENVIRONMENT}-prev-\" | sed 's|^.*:||' | sort -r | head -20"
+
+          jq -n --arg s "$remote" '{commands: [$s]}' > "${RUNNER_TEMP}/ssm-list.json"
+
+          command_id="$(
+            aws ssm send-command \
+              --document-name AWS-RunShellScript \
+              --instance-ids "$INSTANCE_ID" \
+              --timeout-seconds 60 \
+              --comment "churner release list ${ENVIRONMENT}" \
+              --parameters "file://${RUNNER_TEMP}/ssm-list.json" \
+              --query 'Command.CommandId' --output text
+          )"
+
+          state=Pending
+          for _ in $(seq 1 30); do
+            state="$(
+              aws ssm get-command-invocation \
+                --command-id "$command_id" \
+                --instance-id "$INSTANCE_ID" \
+                --query 'Status' --output text 2>/dev/null || printf 'Pending'
+            )"
+            case "$state" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 2
+          done
+
+          {
+            echo "## Available rollback points for ${ENVIRONMENT}"
+            echo
+            if [ "$state" = "Success" ]; then
+              out="$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text)"
+              if [ -n "$out" ]; then
+                echo '```'
+                printf '%s\n' "$out"
+                echo '```'
+                echo
+                echo 'Re-run this workflow with `target-tag` set to one of these — e.g. `production-prev-1787864281` — to deploy it. Nothing was deployed by this run.'
+              else
+                echo "This host holds no \`${ENVIRONMENT}-prev-<unix-ts>\` tags — it has served at most one release, or it was replaced since the last one. Any \`prod-<sha>\` tag still in the registry is also a valid \`target-tag\`. Nothing was deployed by this run."
+              fi
+            else
+              echo "Could not list rollback points (host reported ${state}). Nothing was deployed by this run."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
