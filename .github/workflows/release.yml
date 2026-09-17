@@ -127,9 +127,14 @@ on:
       host-instance-id:
         description: >-
           OVERRIDE for the PRODUCTION host. Leave it empty: the host is found
-          by its `churner-environment-host=<environment>` tag, and the stack
-          creates exactly one, so a hand-copied id is a value that goes stale
-          the moment the host is replaced.
+          by its `churner-environment-host=<environment>` and
+          `churner-project=<project>` tags TOGETHER, and the stack creates
+          exactly one, so a hand-copied id is a value that goes stale the
+          moment the host is replaced. Both tags, because one AWS account may
+          hold several Churner projects and an environment called
+          `production` in each is two hosts under one identical
+          environment-host tag — the deployer role's own `ssm:SendCommand`
+          grant is conditioned on the same pair.
         required: false
         type: string
         default: ''
@@ -374,11 +379,20 @@ jobs:
             --arg actor "$ACTOR" \
             --arg workflowRunUrl "$RUN_URL" \
             '{"project":$project,"env":"rc","eventType":"rc_cut","gitSha":$gitSha,"imageTag":$imageTag,"actor":$actor,"workflowRunUrl":$workflowRunUrl}')"
-          curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
-            -X POST "${TRACKER_URL}/api/internal/deployment-event" \
-            -H "Authorization: Bearer ${TRACKER_TOKEN}" \
-            -H 'Content-Type: application/json' \
-            -d "$body" >/dev/null \
+          # The token reaches curl through a CONFIG FILE on stdin (`-K -`),
+          # never as a `-H` argv entry — an argv is visible to every other
+          # process on the runner (`ps`), a config file on a pipe is not.
+          # `--proto '=https'` because `tracker-url` is caller-supplied: the
+          # scheme is checked above, but without this a redirect could still
+          # carry the bearer over a protocol nobody chose. Same four tokens
+          # the preview workflow's settings fetch already uses, and the same
+          # reason.
+          printf 'header = "Authorization: Bearer %s"\n' "$TRACKER_TOKEN" \
+            | curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
+                --proto '=https' -K - \
+                -X POST "${TRACKER_URL}/api/internal/deployment-event" \
+                -H 'Content-Type: application/json' \
+                -d "$body" >/dev/null \
             || echo "::warning::deployment-event POST failed (continuing — the deploy is not affected)"
 
       - name: Find the candidate host
@@ -386,6 +400,7 @@ jobs:
         env:
           ENVIRONMENT: ${{ inputs.rc-environment }}
           HOST_INSTANCE_ID: ${{ inputs.rc-host-instance-id }}
+          PROJECT_KEY: ${{ inputs.project }}
         run: |
           set -euo pipefail
           if [ -n "$HOST_INSTANCE_ID" ]; then
@@ -398,13 +413,14 @@ jobs:
             instance_id="$(
               aws ssm describe-instance-information \
                 --filters "Key=tag:churner-environment-host,Values=${ENVIRONMENT}" \
+                          "Key=tag:churner-project,Values=${PROJECT_KEY}" \
                 --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
                 --output text
             )"
           fi
           matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
           if [ "$matches" != "1" ]; then
-            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT}, found ${matches}. Pass rc-host-instance-id to choose between several."
+            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT} and churner-project=${PROJECT_KEY}, found ${matches}. Pass rc-host-instance-id to choose between several."
             exit 1
           fi
           echo "instance-id=${instance_id}" >> "$GITHUB_OUTPUT"
@@ -549,11 +565,20 @@ jobs:
             --arg actor "$ACTOR" \
             --arg workflowRunUrl "$RUN_URL" \
             '{"project":$project,"env":"rc","eventType":"rc_deploy","gitSha":$gitSha,"imageTag":$imageTag,"actor":$actor,"workflowRunUrl":$workflowRunUrl}')"
-          curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
-            -X POST "${TRACKER_URL}/api/internal/deployment-event" \
-            -H "Authorization: Bearer ${TRACKER_TOKEN}" \
-            -H 'Content-Type: application/json' \
-            -d "$body" >/dev/null \
+          # The token reaches curl through a CONFIG FILE on stdin (`-K -`),
+          # never as a `-H` argv entry — an argv is visible to every other
+          # process on the runner (`ps`), a config file on a pipe is not.
+          # `--proto '=https'` because `tracker-url` is caller-supplied: the
+          # scheme is checked above, but without this a redirect could still
+          # carry the bearer over a protocol nobody chose. Same four tokens
+          # the preview workflow's settings fetch already uses, and the same
+          # reason.
+          printf 'header = "Authorization: Bearer %s"\n' "$TRACKER_TOKEN" \
+            | curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
+                --proto '=https' -K - \
+                -X POST "${TRACKER_URL}/api/internal/deployment-event" \
+                -H 'Content-Type: application/json' \
+                -d "$body" >/dev/null \
             || echo "::warning::deployment-event POST failed (continuing — the deploy is not affected)"
 
   promote:
@@ -601,6 +626,7 @@ jobs:
         env:
           ENVIRONMENT: ${{ inputs.rc-environment }}
           HOST_INSTANCE_ID: ${{ inputs.rc-host-instance-id }}
+          PROJECT_KEY: ${{ inputs.project }}
         run: |
           set -euo pipefail
           if [ -n "$HOST_INSTANCE_ID" ]; then
@@ -610,13 +636,14 @@ jobs:
             instance_id="$(
               aws ssm describe-instance-information \
                 --filters "Key=tag:churner-environment-host,Values=${ENVIRONMENT}" \
+                          "Key=tag:churner-project,Values=${PROJECT_KEY}" \
                 --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
                 --output text
             )"
           fi
           matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
           if [ "$matches" != "1" ]; then
-            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT}, found ${matches}. Pass rc-host-instance-id to choose between several."
+            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT} and churner-project=${PROJECT_KEY}, found ${matches}. Pass rc-host-instance-id to choose between several."
             exit 1
           fi
           echo "instance-id=${instance_id}" >> "$GITHUB_OUTPUT"
@@ -673,6 +700,16 @@ jobs:
           out="$(aws ssm get-command-invocation --command-id "$command_id" --instance-id "$INSTANCE_ID" --query 'StandardOutputContent' --output text)"
           running_tag="$(printf '%s' "$out" | awk '{print $1}')"
           running_sha="$(printf '%s' "$out" | awk '{print $2}')"
+          # Checked HERE, where the value enters, not only where it is used.
+          # `out` is whatever a host's `docker inspect` printed, so a
+          # multi-line value is reachable; `running_short` below only reads
+          # its first seven characters, so a crafted label passes the confirm
+          # gate and still carries the rest. Its consumers re-validate, but
+          # this is the job holding production's OIDC credentials and it is
+          # the same check, one step earlier.
+          case "$running_sha" in
+            ''|*[!A-Za-z0-9]*) echo "::error::the candidate host reports an unusable sha ('${running_sha}')"; exit 1 ;;
+          esac
           running_short="$(printf '%s' "$running_sha" | cut -c1-7)"
           if [ "$running_short" != "$CONFIRM_SHORT_SHA" ]; then
             echo "::error::confirm-short-sha (${CONFIRM_SHORT_SHA}) does not match what is running on ${RC_ENVIRONMENT} (${running_short}). Nothing was promoted."
@@ -681,9 +718,18 @@ jobs:
           case "$running_tag" in
             ''|*[!A-Za-z0-9._-]*) echo "::error::the candidate host reports an unusable image tag ('${running_tag}')"; exit 1 ;;
           esac
+          # Heredoc form, not `name=value` — the rule the preview workflow
+          # states in its own comment: a value containing a newline in the
+          # `name=value` form is read as further runner commands. Both values
+          # are shape-checked above, so this is defence in depth in the one
+          # job that can deploy to production.
           {
-            echo "running-tag=${running_tag}"
-            echo "running-sha=${running_sha}"
+            echo 'running-tag<<CHURNER_OUTPUT_EOF'
+            echo "$running_tag"
+            echo 'CHURNER_OUTPUT_EOF'
+            echo 'running-sha<<CHURNER_OUTPUT_EOF'
+            echo "$running_sha"
+            echo 'CHURNER_OUTPUT_EOF'
           } >> "$GITHUB_OUTPUT"
 
       # From here on, PRODUCTION's role: the copy reads rc's repository (the
@@ -775,11 +821,20 @@ jobs:
             --arg actor "$ACTOR" \
             --arg workflowRunUrl "$RUN_URL" \
             '{"project":$project,"env":"prod","eventType":"prod_promote","gitSha":$gitSha,"imageTag":$imageTag,"actor":$actor,"workflowRunUrl":$workflowRunUrl}')"
-          curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
-            -X POST "${TRACKER_URL}/api/internal/deployment-event" \
-            -H "Authorization: Bearer ${TRACKER_TOKEN}" \
-            -H 'Content-Type: application/json' \
-            -d "$body" >/dev/null \
+          # The token reaches curl through a CONFIG FILE on stdin (`-K -`),
+          # never as a `-H` argv entry — an argv is visible to every other
+          # process on the runner (`ps`), a config file on a pipe is not.
+          # `--proto '=https'` because `tracker-url` is caller-supplied: the
+          # scheme is checked above, but without this a redirect could still
+          # carry the bearer over a protocol nobody chose. Same four tokens
+          # the preview workflow's settings fetch already uses, and the same
+          # reason.
+          printf 'header = "Authorization: Bearer %s"\n' "$TRACKER_TOKEN" \
+            | curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
+                --proto '=https' -K - \
+                -X POST "${TRACKER_URL}/api/internal/deployment-event" \
+                -H 'Content-Type: application/json' \
+                -d "$body" >/dev/null \
             || echo "::warning::deployment-event POST failed (continuing — the deploy is not affected)"
 
       - name: Find the production host
@@ -787,6 +842,7 @@ jobs:
         env:
           ENVIRONMENT: ${{ inputs.environment }}
           HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
+          PROJECT_KEY: ${{ inputs.project }}
         run: |
           set -euo pipefail
           if [ -n "$HOST_INSTANCE_ID" ]; then
@@ -796,13 +852,14 @@ jobs:
             instance_id="$(
               aws ssm describe-instance-information \
                 --filters "Key=tag:churner-environment-host,Values=${ENVIRONMENT}" \
+                          "Key=tag:churner-project,Values=${PROJECT_KEY}" \
                 --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
                 --output text
             )"
           fi
           matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
           if [ "$matches" != "1" ]; then
-            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT}, found ${matches}. Pass host-instance-id to choose between several."
+            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT} and churner-project=${PROJECT_KEY}, found ${matches}. Pass host-instance-id to choose between several."
             exit 1
           fi
           echo "instance-id=${instance_id}" >> "$GITHUB_OUTPUT"
@@ -944,11 +1001,20 @@ jobs:
             --arg actor "$ACTOR" \
             --arg workflowRunUrl "$RUN_URL" \
             '{"project":$project,"env":"prod","eventType":"prod_deploy","gitSha":$gitSha,"imageTag":$imageTag,"actor":$actor,"workflowRunUrl":$workflowRunUrl}')"
-          curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
-            -X POST "${TRACKER_URL}/api/internal/deployment-event" \
-            -H "Authorization: Bearer ${TRACKER_TOKEN}" \
-            -H 'Content-Type: application/json' \
-            -d "$body" >/dev/null \
+          # The token reaches curl through a CONFIG FILE on stdin (`-K -`),
+          # never as a `-H` argv entry — an argv is visible to every other
+          # process on the runner (`ps`), a config file on a pipe is not.
+          # `--proto '=https'` because `tracker-url` is caller-supplied: the
+          # scheme is checked above, but without this a redirect could still
+          # carry the bearer over a protocol nobody chose. Same four tokens
+          # the preview workflow's settings fetch already uses, and the same
+          # reason.
+          printf 'header = "Authorization: Bearer %s"\n' "$TRACKER_TOKEN" \
+            | curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
+                --proto '=https' -K - \
+                -X POST "${TRACKER_URL}/api/internal/deployment-event" \
+                -H 'Content-Type: application/json' \
+                -d "$body" >/dev/null \
             || echo "::warning::deployment-event POST failed (continuing — the deploy is not affected)"
 
   rollback:
@@ -1003,6 +1069,7 @@ jobs:
         env:
           ENVIRONMENT: ${{ inputs.environment }}
           HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
+          PROJECT_KEY: ${{ inputs.project }}
         run: |
           set -euo pipefail
           if [ -n "$HOST_INSTANCE_ID" ]; then
@@ -1012,13 +1079,14 @@ jobs:
             instance_id="$(
               aws ssm describe-instance-information \
                 --filters "Key=tag:churner-environment-host,Values=${ENVIRONMENT}" \
+                          "Key=tag:churner-project,Values=${PROJECT_KEY}" \
                 --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
                 --output text
             )"
           fi
           matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
           if [ "$matches" != "1" ]; then
-            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT}, found ${matches}. Pass host-instance-id to choose between several."
+            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT} and churner-project=${PROJECT_KEY}, found ${matches}. Pass host-instance-id to choose between several."
             exit 1
           fi
           echo "instance-id=${instance_id}" >> "$GITHUB_OUTPUT"
@@ -1158,11 +1226,20 @@ jobs:
             --arg actor "$ACTOR" \
             --arg workflowRunUrl "$RUN_URL" \
             '{"project":$project,"env":"prod","eventType":"rollback","imageTag":$imageTag,"actor":$actor,"workflowRunUrl":$workflowRunUrl}')"
-          curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
-            -X POST "${TRACKER_URL}/api/internal/deployment-event" \
-            -H "Authorization: Bearer ${TRACKER_TOKEN}" \
-            -H 'Content-Type: application/json' \
-            -d "$body" >/dev/null \
+          # The token reaches curl through a CONFIG FILE on stdin (`-K -`),
+          # never as a `-H` argv entry — an argv is visible to every other
+          # process on the runner (`ps`), a config file on a pipe is not.
+          # `--proto '=https'` because `tracker-url` is caller-supplied: the
+          # scheme is checked above, but without this a redirect could still
+          # carry the bearer over a protocol nobody chose. Same four tokens
+          # the preview workflow's settings fetch already uses, and the same
+          # reason.
+          printf 'header = "Authorization: Bearer %s"\n' "$TRACKER_TOKEN" \
+            | curl -sS --fail-with-body --max-time 10 --retry 2 --retry-delay 3 --retry-connrefused \
+                --proto '=https' -K - \
+                -X POST "${TRACKER_URL}/api/internal/deployment-event" \
+                -H 'Content-Type: application/json' \
+                -d "$body" >/dev/null \
             || echo "::warning::deployment-event POST failed (continuing — the deploy is not affected)"
 
   # No `target-tag` means "show me what I could roll back to" — it deploys
@@ -1217,6 +1294,7 @@ jobs:
         env:
           ENVIRONMENT: ${{ inputs.environment }}
           HOST_INSTANCE_ID: ${{ inputs.host-instance-id }}
+          PROJECT_KEY: ${{ inputs.project }}
         run: |
           set -euo pipefail
           if [ -n "$HOST_INSTANCE_ID" ]; then
@@ -1226,13 +1304,14 @@ jobs:
             instance_id="$(
               aws ssm describe-instance-information \
                 --filters "Key=tag:churner-environment-host,Values=${ENVIRONMENT}" \
+                          "Key=tag:churner-project,Values=${PROJECT_KEY}" \
                 --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
                 --output text
             )"
           fi
           matches="$(printf '%s' "$instance_id" | wc -w | tr -d '[:space:]')"
           if [ "$matches" != "1" ]; then
-            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT}, found ${matches}. Pass host-instance-id to choose between several."
+            echo "::error::expected exactly one Online instance tagged churner-environment-host=${ENVIRONMENT} and churner-project=${PROJECT_KEY}, found ${matches}. Pass host-instance-id to choose between several."
             exit 1
           fi
           echo "instance-id=${instance_id}" >> "$GITHUB_OUTPUT"
@@ -1294,6 +1373,10 @@ jobs:
                 printf '%s\n' "$out"
                 echo '```'
                 echo
+                # SC2016: the backticks are Markdown for the run summary, and
+                # single quotes are what keep the shell from treating them as
+                # command substitution — nothing here is meant to expand.
+                # shellcheck disable=SC2016
                 echo 'Re-run this workflow with `target-tag` set to one of these — e.g. `production-prev-1787864281` — to deploy it. Nothing was deployed by this run.'
               else
                 echo "This host holds no \`${ENVIRONMENT}-prev-<unix-ts>\` tags — it has served at most one release, or it was replaced since the last one. Any \`prod-<sha>\` tag still in the registry is also a valid \`target-tag\`. Nothing was deployed by this run."

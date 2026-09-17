@@ -3,7 +3,7 @@
 The reusable GitHub Actions workflow that drives a release's whole lifecycle
 — cut a candidate, promote it to production, or roll production back — across
 the two environments the
-[Churner environment stack](../../infrastructure/customer/environment-stack/README.md)
+[Churner environment stack](https://github.com/churner-ai/environment-stack/blob/v1/README.md)
 created in your account, under your identity.
 
 Apply the environment stack **twice**: once for your candidate environment
@@ -173,6 +173,17 @@ carries one, is what the scaffolded caller renders `rc-secret-keys` from
 instead; that is the asymmetric case, and it is the only reason the two are
 separate inputs.
 
+**The NAMES are read once, when you (re-)scaffold.** `secret-keys` /
+`rc-secret-keys` are static `with:` values baked into the committed
+workflow file at the moment Churner renders it — this file is a caller,
+not a script, and cannot read your repository at dispatch time. Editing
+`.churner/release/secrets` alone changes nothing until Churner re-commits
+the workflow files (the "Set up the release workflows" button on the
+project's Build tab, which reads "Update the release workflows" once the
+project has deployed); the four files are replaced in place every time,
+so a rotated deployer-role ARN and an edited secrets list both reach the
+caller the same way.
+
 **Store each name under BOTH environments' prefixes before the deploy that
 names it** — `<production prefix>/STRIPE_SECRET_KEY` *and*
 `<rc prefix>/STRIPE_SECRET_KEY`. A name the host cannot read is a hard
@@ -189,7 +200,8 @@ RDS-managed secret named by `db-secret-arn` (or `rc-db-secret-arn`).
 
 Every AWS action this workflow calls is one the relevant environment's
 deployer role grants, and nothing more
-(`infrastructure/customer/environment-stack/README.md` → "The boundary"):
+([`churner-ai/environment-stack`](https://github.com/churner-ai/environment-stack/blob/v1/README.md)
+→ "The boundary"):
 
 ```
 codebuild:StartBuild / codebuild:BatchGetBuilds     cut-rc's build           (rc role)
