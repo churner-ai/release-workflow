@@ -247,7 +247,7 @@ on:
           scripts, and re-pin their checksums with it.
         required: false
         type: string
-        default: https://raw.githubusercontent.com/churner-ai/environment-stack/refs/tags/v1
+        default: https://raw.githubusercontent.com/churner-ai/environment-stack/refs/tags/v1.2
     secrets:
       tracker-token:
         description: >-

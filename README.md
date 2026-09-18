@@ -36,7 +36,7 @@ jobs:
     permissions:
       id-token: write     # mint the OIDC assertion for the deployer roles
       contents: read
-    uses: churner-ai/release-workflow/.github/workflows/release.yml@v1
+    uses: churner-ai/release-workflow/.github/workflows/release.yml@v1.2
     with:
       project: MC
       action: ${{ inputs.action }}
@@ -141,7 +141,7 @@ new AWS grant.
 | `target-tag` | no | `''` | `rollback` only. The tag to redeploy. Leave EMPTY to run the `list` job instead. |
 | `health-path` | no | `/` | Rooted path the readiness gate polls on the candidate release's own port before it is swapped live. |
 | `tracker-url` | no | `https://churner.ai` | Base URL of your Churner instance. https only. |
-| `scripts-base-url` | no | `churner-ai/environment-stack` @ `refs/tags/v1` | Where `host/deploy-release.sh` and `scripts/copy-image.sh` are fetched from — the SAME base URL the environment host's own `bootstrap.sh` uses. Tags are immutable once published. |
+| `scripts-base-url` | no | `churner-ai/environment-stack` @ `refs/tags/v1.2` | Where `host/deploy-release.sh` and `scripts/copy-image.sh` are fetched from — the SAME base URL the environment host's own `bootstrap.sh` uses. Tags are immutable once published. |
 
 | Secret | Required | Meaning |
 |---|---|---|
