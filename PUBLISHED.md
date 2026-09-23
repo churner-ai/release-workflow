@@ -9,10 +9,10 @@ EXECUTES this workflow's own SSM step and both host scripts against shimmed
 `docker` / `aws` / `systemctl` / `curl`).
 
 The two scripts this workflow fetches at run time are **not** in this
-repository. They come from `churner-ai/environment-stack@v1.2` — the
+repository. They come from `churner-ai/environment-stack@v1.3` — the
 public repository an environment host also fetches `bootstrap.sh` from, and
 the tag this workflow's own `scripts-base-url` default names — and are
 verified against the SHA-256 pins in this workflow's `env:` block before
 either one runs.
 
-Released from churner monorepo commit `bd29e3e`.
+Released from churner monorepo commit `f0d3e183`.

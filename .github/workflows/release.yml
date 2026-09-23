@@ -241,13 +241,14 @@ on:
           image copier (`scripts/copy-image.sh`) are fetched from. A PINNED,
           IMMUTABLE TAG on the PUBLIC `churner-ai/environment-stack`
           repository, never a branch — the host runs what it fetches, as
-          root, and fetches it with an unauthenticated curl. It is the SAME
-          base URL the environment stack's own `bootstrap.sh` uses, so one
-          tag serves every artefact. Override it only if you vendor the
+          root, and fetches it with an unauthenticated curl. It is the same
+          repository the environment stack's own `bootstrap.sh` comes from,
+          possibly a LATER tag of it (one that changed only these scripts, so
+          hosts need not restart). Override it only if you vendor the
           scripts, and re-pin their checksums with it.
         required: false
         type: string
-        default: https://raw.githubusercontent.com/churner-ai/environment-stack/refs/tags/v1.2
+        default: https://raw.githubusercontent.com/churner-ai/environment-stack/refs/tags/v1.3
     secrets:
       tracker-token:
         description: >-
@@ -260,7 +261,7 @@ on:
 # runs. Tests assert them against the files' actual bytes, so a script edited
 # without re-pinning fails CI rather than failing on a customer's host.
 env:
-  CHURNER_RELEASE_SCRIPT_SHA256: 76d01154cb73fff4c5e6ec4f743d7a9fc65b2c9b26104feccab855332224f5a5
+  CHURNER_RELEASE_SCRIPT_SHA256: 8e03980ee73e5bec946158aa203b9252df9a98c05787d16f6acecc4929ce524e
   CHURNER_COPY_SCRIPT_SHA256: 896afb7e002ae3c631109474e91061090a27d5eaec0c82c9555563228c74e323
 
 jobs:
@@ -484,8 +485,21 @@ jobs:
           # bracket expression checks a list without having to express "a
           # space" inside one.
           case "$(printf '%s' "$SECRET_KEYS" | tr -d ' ')" in
-            *[!A-Za-z0-9_]*) echo "::error::secret-keys must be space-separated environment-variable names"; exit 1 ;;
+            *[!A-Za-z0-9_:]*) echo "::error::secret-keys must be space-separated environment-variable names (optionally NAME:generate)"; exit 1 ;;
           esac
+          # Each token is `NAME` or `NAME:generate` (a secret the app owns,
+          # created on the host when absent). The charset check above runs
+          # first, so the unquoted expansion below can never glob.
+          for token in $SECRET_KEYS; do
+            case "$token" in
+              *:generate) name="${token%:generate}" ;;
+              *:*) echo "::error::secret-keys: '${token}' has an unknown suffix (the only one understood is ':generate')"; exit 1 ;;
+              *) name="$token" ;;
+            esac
+            case "$name" in
+              ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) echo "::error::secret-keys must be space-separated environment-variable names (optionally NAME:generate)"; exit 1 ;;
+            esac
+          done
 
           remote="$(cat <<REMOTE
           set -euo pipefail
@@ -907,8 +921,21 @@ jobs:
             *[!A-Za-z0-9:/_+=.@!-]*) echo "::error::db-secret-arn contains a character an ARN cannot hold"; exit 1 ;;
           esac
           case "$(printf '%s' "$SECRET_KEYS" | tr -d ' ')" in
-            *[!A-Za-z0-9_]*) echo "::error::secret-keys must be space-separated environment-variable names"; exit 1 ;;
+            *[!A-Za-z0-9_:]*) echo "::error::secret-keys must be space-separated environment-variable names (optionally NAME:generate)"; exit 1 ;;
           esac
+          # Each token is `NAME` or `NAME:generate` (a secret the app owns,
+          # created on the host when absent). The charset check above runs
+          # first, so the unquoted expansion below can never glob.
+          for token in $SECRET_KEYS; do
+            case "$token" in
+              *:generate) name="${token%:generate}" ;;
+              *:*) echo "::error::secret-keys: '${token}' has an unknown suffix (the only one understood is ':generate')"; exit 1 ;;
+              *) name="$token" ;;
+            esac
+            case "$name" in
+              ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) echo "::error::secret-keys must be space-separated environment-variable names (optionally NAME:generate)"; exit 1 ;;
+            esac
+          done
           case "$AWS_REGION" in
             ''|*[!a-z0-9-]*) echo "::error::aws-region must be lowercase letters, digits and '-' (got '${AWS_REGION}')"; exit 1 ;;
           esac
@@ -1136,8 +1163,21 @@ jobs:
             *[!A-Za-z0-9:/_+=.@!-]*) echo "::error::db-secret-arn contains a character an ARN cannot hold"; exit 1 ;;
           esac
           case "$(printf '%s' "$SECRET_KEYS" | tr -d ' ')" in
-            *[!A-Za-z0-9_]*) echo "::error::secret-keys must be space-separated environment-variable names"; exit 1 ;;
+            *[!A-Za-z0-9_:]*) echo "::error::secret-keys must be space-separated environment-variable names (optionally NAME:generate)"; exit 1 ;;
           esac
+          # Each token is `NAME` or `NAME:generate` (a secret the app owns,
+          # created on the host when absent). The charset check above runs
+          # first, so the unquoted expansion below can never glob.
+          for token in $SECRET_KEYS; do
+            case "$token" in
+              *:generate) name="${token%:generate}" ;;
+              *:*) echo "::error::secret-keys: '${token}' has an unknown suffix (the only one understood is ':generate')"; exit 1 ;;
+              *) name="$token" ;;
+            esac
+            case "$name" in
+              ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) echo "::error::secret-keys must be space-separated environment-variable names (optionally NAME:generate)"; exit 1 ;;
+            esac
+          done
           image_uri="${REGISTRY}/${REPO}:${TAG}"
           # The COMPOSED value, checked after composing it: `cut-rc` guarded
           # its own image URI and this one did not, though the string lands in

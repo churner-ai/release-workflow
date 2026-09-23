@@ -36,7 +36,7 @@ jobs:
     permissions:
       id-token: write     # mint the OIDC assertion for the deployer roles
       contents: read
-    uses: churner-ai/release-workflow/.github/workflows/release.yml@v1.2
+    uses: churner-ai/release-workflow/.github/workflows/release.yml@v1.3
     with:
       project: MC
       action: ${{ inputs.action }}
@@ -192,6 +192,30 @@ fails somewhere far less obvious. That is also why the two lists are separate
 inputs rather than one: a production-only secret added to a single shared list
 would break the next `cut-rc`, which is a deploy to the candidate failing over
 a name that has nothing to do with it.
+
+**A name written `NAME:generate` needs no storing.** It marks a secret the
+application owns — a signing key, an encryption key, an internal token —
+and the host creates `<its prefix>/NAME` when it does not exist (48 random
+bytes, base64url, tagged `churner-generated=true`; only a
+`ResourceNotFoundException` triggers the create, and an existing secret is
+never overwritten), so each environment gets its own value. The token rides
+`secret-keys` / `rc-secret-keys` as written; the container receives `NAME`.
+The create is allowed by the environment host role's `CreateGeneratedSecrets`
+statement, which Churner surfaces as a stack update for environments applied
+before it existed; until that update is applied, the deploy fails naming the
+fix — apply the current template from Churner's Access page, or create the
+secret yourself. A name added to `.churner/release/secrets` reaches the
+committed callers only after they are re-scaffolded (see "The NAMES are read
+once" above).
+
+**Rollout order for an existing repository.** (1) Apply the stack update the
+Access page offers — it adds only the create grant. (2) Move the repository's
+callers onto a workflow version that understands the form (the preview workflow
+at `@v3`, this workflow at `@v1.3`) by re-scaffolding them —
+"Update the release workflows" on the project's Build tab. (3) Only then add
+`NAME:generate` lines: a caller on an older version rejects the form and fails
+every deploy, which is why Churner's agent writes the line only after checking
+the pin.
 
 `DATABASE_URL` is not one of these — the host composes it from the
 RDS-managed secret named by `db-secret-arn` (or `rc-db-secret-arn`).
