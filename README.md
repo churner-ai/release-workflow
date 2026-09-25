@@ -36,7 +36,7 @@ jobs:
     permissions:
       id-token: write     # mint the OIDC assertion for the deployer roles
       contents: read
-    uses: churner-ai/release-workflow/.github/workflows/release.yml@v1.3
+    uses: churner-ai/release-workflow/.github/workflows/release.yml@v1.4
     with:
       project: MC
       action: ${{ inputs.action }}
@@ -87,10 +87,18 @@ does reaches a real user.
 `rc` and `production` are separate created environments — separate hosts,
 databases, registries and deployer roles (design spec §7.2/§7.4).
 
-- **`cut-rc`** builds the given `sha` on the CANDIDATE environment's
-  CodeBuild project, tags it `rc-<sha>` (or `image-tag`, if set), and deploys
-  it on the CANDIDATE host. Production is untouched, and this job's
-  credentials cannot reach it.
+- **`cut-rc`** checks out the given `sha`, uploads it (`git archive`, no
+  history) to `build-contexts/<repo>/<sha>.tar.gz` in the CANDIDATE
+  environment's build-context bucket (`churner-<key>-<env>-src-<account>`),
+  builds it on that environment's CodeBuild project FROM the upload, tags it
+  `rc-<sha>` (or `image-tag`, if set), and deploys it on the CANDIDATE host.
+  The build never clones from GitHub (the project's own source is S3, at the
+  bucket's `build-contexts/` prefix, and each build overrides only the
+  location), so a private repository needs no CodeBuild source credential.
+  It needs a stack applied since the bucket existed: Churner moves a
+  repository onto `@v1.4` only once the stack reports it, and an upload that
+  finds none fails with one line saying to apply the stack update. Production
+  is untouched, and this job's credentials cannot reach it.
 - **`promote`** reads what is CURRENTLY RUNNING on the candidate host,
   refuses unless its short sha matches `confirm-short-sha`, **copies that
   exact image** into production's repository as `prod-<sha>`, and deploys it
@@ -173,16 +181,16 @@ carries one, is what the scaffolded caller renders `rc-secret-keys` from
 instead; that is the asymmetric case, and it is the only reason the two are
 separate inputs.
 
-**The NAMES are read once, when you (re-)scaffold.** `secret-keys` /
-`rc-secret-keys` are static `with:` values baked into the committed
-workflow file at the moment Churner renders it — this file is a caller,
-not a script, and cannot read your repository at dispatch time. Editing
-`.churner/release/secrets` alone changes nothing until Churner re-commits
-the workflow files (the "Set up the release workflows" button on the
-project's Build tab, which reads "Update the release workflows" once the
-project has deployed); the four files are replaced in place every time,
-so a rotated deployer-role ARN and an edited secrets list both reach the
-caller the same way.
+**The NAMES are baked into the caller.** `secret-keys` / `rc-secret-keys`
+are static `with:` values in the committed workflow file, written at the
+moment Churner renders it — this file is a caller, not a script, and cannot
+read your repository at dispatch time. Editing `.churner/release/secrets`
+therefore changes nothing by itself; Churner notices the push (it watches
+`.churner/` and `.github/workflows/` on the default branch) and opens — or
+moves — its one **"Update Churner workflows"** pull request, and the new
+names take effect once that pull request is merged (by itself, under the
+project's default "Workflow updates" setting). A rotated deployer-role ARN
+and a newer workflow version reach the caller the same way.
 
 **Store each name under BOTH environments' prefixes before the deploy that
 names it** — `<production prefix>/STRIPE_SECRET_KEY` *and*
@@ -204,15 +212,16 @@ The create is allowed by the environment host role's `CreateGeneratedSecrets`
 statement, which Churner surfaces as a stack update for environments applied
 before it existed; until that update is applied, the deploy fails naming the
 fix — apply the current template from Churner's Access page, or create the
-secret yourself. A name added to `.churner/release/secrets` reaches the
-committed callers only after they are re-scaffolded (see "The NAMES are read
-once" above).
+secret yourself. A name added to `.churner/release/secrets` takes effect once
+Churner's workflow update pull request carrying it is merged (see "The NAMES
+are baked into the caller" above).
 
 **Rollout order for an existing repository.** (1) Apply the stack update the
-Access page offers — it adds only the create grant. (2) Move the repository's
-callers onto a workflow version that understands the form (the preview workflow
-at `@v3`, this workflow at `@v1.3`) by re-scaffolding them —
-"Update the release workflows" on the project's Build tab. (3) Only then add
+Access page offers — it adds only the create grant. (2) Let the repository's
+callers move onto a workflow version that understands the form (the preview
+workflow at `@v3`, this workflow at `@v1.3` or later) — Churner opens its "Update
+Churner workflows" pull request for that by itself, and the Build tab's
+Workflows row shows where it is. (3) Only then add
 `NAME:generate` lines: a caller on an older version rejects the form and fails
 every deploy, which is why Churner's agent writes the line only after checking
 the pin.
@@ -228,6 +237,7 @@ deployer role grants, and nothing more
 → "The boundary"):
 
 ```
+s3:PutObject (build-contexts/* of rc's bucket)       upload the commit        (rc role)
 codebuild:StartBuild / codebuild:BatchGetBuilds     cut-rc's build           (rc role)
 ssm:DescribeInstanceInformation                     find a host by tag       (both)
 ssm:SendCommand / ssm:GetCommandInvocation          run the host script      (both)

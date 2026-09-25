@@ -15,9 +15,13 @@
 # and its own deployer role. That separation is the point of a release
 # pipeline — the candidate has to land somewhere that is not production.
 #
-#   cut-rc    builds the commit on RC's CodeBuild project, pushes `rc-<sha>`
-#             to RC's repository, and deploys it on the RC HOST. It assumes
-#             `rc-role-arn` and can reach nothing in production.
+#   cut-rc    uploads the commit (a `git archive` of this run's own checkout,
+#             no history) to RC's build-context bucket, builds it on RC's
+#             CodeBuild project from that upload — never from a clone, so a
+#             private repository needs no CodeBuild source credential —
+#             pushes `rc-<sha>` to RC's repository, and deploys it on the RC
+#             HOST. It assumes `rc-role-arn` and can reach nothing in
+#             production.
 #   promote   reads what is actually running on the RC host, refuses unless
 #             its short sha matches `confirm-short-sha`, COPIES that exact
 #             image into production's repository as `prod-<sha>`, and deploys
@@ -39,6 +43,8 @@
 #
 # ## Everything it does, it does with the deployer roles' enumerated grants
 #
+#   s3:PutObject                       upload the commit under `build-contexts/`
+#                                      of RC's build-context bucket (cut-rc)
 #   codebuild:StartBuild               start the image build (cut-rc, rc role)
 #   codebuild:BatchGetBuilds           poll it to a terminal phase
 #   ecr:BatchGetImage                  read the source manifest (promote)
@@ -52,7 +58,7 @@
 #   ssm:SendCommand                    run the host script on it
 #   ssm:GetCommandInvocation           read that command's result BY ID
 #
-# and nothing else. A test derives every `aws codebuild|ssm|ecr` call this
+# and nothing else. A test derives every `aws codebuild|ssm|ecr|s3api` call this
 # file and `scripts/copy-image.sh` make, and asserts each is granted — by
 # ACTION and by the REPOSITORY it names — with `ecr:GetAuthorizationToken`
 # the one deliberate unused grant (docker authentication happens ON THE HOST,
@@ -310,26 +316,90 @@ jobs:
           tag="${INPUT_IMAGE_TAG:-rc-${sha}}"
           repo="churner-$(slug "$PROJECT")-$(slug "$ENVIRONMENT")"
           image_uri="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${repo}:${tag}"
+          # The environment stack names the bucket `<resource name>-src-<account>`
+          # (`environmentBuildContextBucketNameFor`) — the resource name being
+          # the registry's own, derived above the same way.
+          bucket="${repo}-src-${ACCOUNT_ID}"
           {
             echo "sha=${sha}"
             echo "tag=${tag}"
             echo "repo=${repo}"
             echo "image-uri=${image_uri}"
+            echo "build-context-bucket=${bucket}"
           } >> "$GITHUB_OUTPUT"
+
+      # The commit being cut, checked out so the build can be sent its bytes
+      # rather than told to clone them. `persist-credentials: false`: nothing
+      # after this talks to GitHub.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.ids.outputs.sha }}
+          persist-credentials: false
 
       - name: Build the image
         id: build
         env:
           CODEBUILD_PROJECT: ${{ inputs.rc-codebuild-project }}
+          BUILD_CONTEXT_BUCKET: ${{ steps.ids.outputs.build-context-bucket }}
+          REPOSITORY: ${{ github.event.repository.name }}
           HEAD_SHA: ${{ steps.ids.outputs.sha }}
           IMAGE_TAG: ${{ steps.ids.outputs.tag }}
         run: |
           set -euo pipefail
+
+          # Checked before anything is uploaded: each lands in an S3 key or a
+          # CodeBuild argument.
+          case "$BUILD_CONTEXT_BUCKET" in
+            ""|*[!a-z0-9.-]*) echo "::error::refusing an unusable build-context bucket name (got '${BUILD_CONTEXT_BUCKET}')"; exit 1 ;;
+          esac
+          case "$REPOSITORY" in
+            ""|*[!A-Za-z0-9._-]*) echo "::error::refusing an unusable repository name"; exit 1 ;;
+          esac
+          case "$HEAD_SHA" in
+            ""|*[!A-Za-z0-9._-]*) echo "::error::refusing an unusable commit (got '${HEAD_SHA}')"; exit 1 ;;
+          esac
+
+          # The source comes from THIS checkout — the exact commit, as a
+          # tarball with no history — never from a clone CodeBuild makes, so
+          # the build needs no GitHub credential of any kind.
+          archive="${HEAD_SHA}.tar.gz"
+          key="build-contexts/${REPOSITORY}/${archive}"
+          git archive --format=tar.gz -o "${RUNNER_TEMP}/${archive}" "$HEAD_SHA"
+          # A stack applied before the bucket existed answers NoSuchBucket (or
+          # AccessDenied — the role predates the grant too). Churner does not
+          # move a repository onto this version until the stack reports the
+          # bucket, so this is the one-line reason if it happens anyway.
+          if ! upload_err="$(
+            aws s3api put-object \
+              --bucket "$BUILD_CONTEXT_BUCKET" \
+              --key "$key" \
+              --body "${RUNNER_TEMP}/${archive}" \
+              --output text 2>&1 >/dev/null
+          )"; then
+            case "$upload_err" in
+              *NoSuchBucket*|*AccessDenied*)
+                echo "::error::The build-context bucket ${BUILD_CONTEXT_BUCKET} doesn't exist yet, or this workflow's role can't write to it — apply the stack update from Churner's Infrastructure page."
+                ;;
+              *)
+                echo "::error::Uploading the build context to ${BUILD_CONTEXT_BUCKET} failed: ${upload_err}"
+                ;;
+            esac
+            exit 1
+          fi
+          echo "Uploaded s3://${BUILD_CONTEXT_BUCKET}/${key}"
+
+          # The project's own source is S3, at the bucket's `build-contexts/`
+          # prefix, so only the LOCATION is overridden (the type never
+          # changes, which is what keeps the project's inline buildspec), and
+          # `SOURCE_ARCHIVE` tells the buildspec which file to unpack —
+          # CodeBuild extracts only a zip itself.
           build_id="$(
             aws codebuild start-build \
               --project-name "$CODEBUILD_PROJECT" \
-              --source-version "$HEAD_SHA" \
-              --environment-variables-override "name=IMAGE_TAG,value=${IMAGE_TAG},type=PLAINTEXT" \
+              --source-location-override "${BUILD_CONTEXT_BUCKET}/${key}" \
+              --environment-variables-override \
+                "name=IMAGE_TAG,value=${IMAGE_TAG},type=PLAINTEXT" \
+                "name=SOURCE_ARCHIVE,value=${archive},type=PLAINTEXT" \
               --query 'build.id' --output text
           )"
           echo "Started CodeBuild ${build_id}"

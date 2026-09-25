@@ -15,4 +15,4 @@ the tag this workflow's own `scripts-base-url` default names — and are
 verified against the SHA-256 pins in this workflow's `env:` block before
 either one runs.
 
-Released from churner monorepo commit `f0d3e183`.
+Released from churner monorepo commit `61fe022e`.
