@@ -25,7 +25,12 @@
 #   promote   reads what is actually running on the RC host, refuses unless
 #             its short sha matches `confirm-short-sha`, COPIES that exact
 #             image into production's repository as `prod-<sha>`, and deploys
-#             it on the PRODUCTION host. It assumes `role-arn`.
+#             it on the PRODUCTION host. It assumes `role-arn`. Given
+#             `image-digest`, it copies THAT image out of RC's repository
+#             instead — the build a release check judged, whether or not RC
+#             runs it now — and refuses unless the image's own commit label
+#             is the commit `confirm-short-sha` names; it never assumes
+#             `rc-role-arn` then.
 #   rollback  redeploys a named tag on the production host, under `role-arn`.
 #
 # The copy is a copy, not a retag: `ecr:PutImage` validates that a manifest's
@@ -85,7 +90,7 @@ on:
   workflow_call:
     inputs:
       project:
-        description: Churner project key, e.g. `MC`.
+        description: Churner project key, e.g. `ACME`.
         required: true
         type: string
       environment:
@@ -174,7 +179,21 @@ on:
           commit you mean to promote — checked against what is ACTUALLY
           running on the candidate host before anything is copied, so a
           promote can never ship a different build than the one the operator
-          looked at.
+          looked at. With `image-digest`, checked against that image's
+          `org.opencontainers.image.revision` label instead (a prefix of at
+          least seven characters, or the whole commit).
+        required: false
+        type: string
+        default: ''
+      image-digest:
+        description: >-
+          `promote` only. The digest (`sha256:…`) of the image in the
+          candidate's repository to promote. Given it, the promote copies
+          exactly that image and refuses, before anything is written, unless
+          its `org.opencontainers.image.revision` label is the commit
+          `confirm-short-sha` names — the candidate host is not asked what it
+          runs, and need not be running it. Leave it empty to promote what
+          the candidate is running now.
         required: false
         type: string
         default: ''
@@ -254,7 +273,7 @@ on:
           scripts, and re-pin their checksums with it.
         required: false
         type: string
-        default: https://raw.githubusercontent.com/churner-ai/environment-stack/refs/tags/v1.3
+        default: https://raw.githubusercontent.com/churner-ai/environment-stack/refs/tags/v1.4
     secrets:
       tracker-token:
         description: >-
@@ -268,7 +287,7 @@ on:
 # without re-pinning fails CI rather than failing on a customer's host.
 env:
   CHURNER_RELEASE_SCRIPT_SHA256: 8e03980ee73e5bec946158aa203b9252df9a98c05787d16f6acecc4929ce524e
-  CHURNER_COPY_SCRIPT_SHA256: 896afb7e002ae3c631109474e91061090a27d5eaec0c82c9555563228c74e323
+  CHURNER_COPY_SCRIPT_SHA256: f1e1f60ad60dffc108d29923f5fc805d439dfa73cc8dbb58c49fa946aaa50d23
 
 jobs:
   cut-rc:
@@ -392,7 +411,8 @@ jobs:
           # prefix, so only the LOCATION is overridden (the type never
           # changes, which is what keeps the project's inline buildspec), and
           # `SOURCE_ARCHIVE` tells the buildspec which file to unpack —
-          # CodeBuild extracts only a zip itself.
+          # CodeBuild extracts only a zip itself. `GIT_SHA` is the commit the
+          # image is labelled with (`org.opencontainers.image.revision`).
           build_id="$(
             aws codebuild start-build \
               --project-name "$CODEBUILD_PROJECT" \
@@ -400,6 +420,7 @@ jobs:
               --environment-variables-override \
                 "name=IMAGE_TAG,value=${IMAGE_TAG},type=PLAINTEXT" \
                 "name=SOURCE_ARCHIVE,value=${archive},type=PLAINTEXT" \
+                "name=GIT_SHA,value=${HEAD_SHA},type=PLAINTEXT" \
               --query 'build.id' --output text
           )"
           echo "Started CodeBuild ${build_id}"
@@ -683,9 +704,12 @@ jobs:
     steps:
       # FIRST under the CANDIDATE's role: everything up to and including
       # "what is running on rc" is a question about rc, and production's role
-      # cannot reach rc's host at all.
+      # cannot reach rc's host at all. A promote by `image-digest` asks rc's
+      # host nothing — the image's own commit label is checked in the copy —
+      # so it skips these steps and never assumes the candidate's role.
       - uses: aws-actions/configure-aws-credentials@796449b3e38e3c256861227399e58b780e0e5538 # v6
         id: rc-creds
+        if: inputs.image-digest == ''
         with:
           role-to-assume: ${{ inputs.rc-role-arn }}
           aws-region: ${{ inputs.aws-region }}
@@ -707,6 +731,7 @@ jobs:
 
       - name: Find the candidate host
         id: rc-host
+        if: inputs.image-digest == ''
         env:
           ENVIRONMENT: ${{ inputs.rc-environment }}
           HOST_INSTANCE_ID: ${{ inputs.rc-host-instance-id }}
@@ -737,6 +762,7 @@ jobs:
       # approving the environment gate above.
       - name: Verify what is running on the candidate
         id: running
+        if: inputs.image-digest == ''
         env:
           RC_ENVIRONMENT: ${{ inputs.rc-environment }}
           CONFIRM_SHORT_SHA: ${{ inputs.confirm-short-sha }}
@@ -827,6 +853,7 @@ jobs:
       # line, where discovering the behaviour on a customer's promote is a
       # failed production deploy.
       - name: Clear the candidate's credentials
+        if: inputs.image-digest == ''
         run: |
           set -euo pipefail
           {
@@ -842,6 +869,9 @@ jobs:
           aws-region: ${{ inputs.aws-region }}
           role-session-name: churner-release-promote
 
+      # Writes `tag` and `sha` — the commit every later step deploys and
+      # reports: what rc's host said it runs, or, by `image-digest`, what the
+      # image's own label states.
       - name: Copy the image into production
         id: copy
         env:
@@ -849,6 +879,8 @@ jobs:
           SOURCE_TAG: ${{ steps.running.outputs.running-tag }}
           TARGET_REPO: ${{ steps.ids.outputs.repo }}
           SHA: ${{ steps.running.outputs.running-sha }}
+          IMAGE_DIGEST: ${{ inputs.image-digest }}
+          CONFIRM_SHORT_SHA: ${{ inputs.confirm-short-sha }}
           SCRIPTS_BASE_URL: ${{ inputs.scripts-base-url }}
         run: |
           set -euo pipefail
@@ -856,26 +888,62 @@ jobs:
             https://*) ;;
             *) echo "::error::scripts-base-url must be https — the host runs what it fetches, as root"; exit 1 ;;
           esac
-          case "$SHA" in
-            ''|*[!A-Za-z0-9]*) echo "::error::the candidate host reports an unusable sha ('${SHA}')"; exit 1 ;;
-          esac
-          target_tag="prod-${SHA}"
+          if [ -n "$IMAGE_DIGEST" ]; then
+            [ -n "$CONFIRM_SHORT_SHA" ] || { echo "::error::confirm-short-sha is required for promote"; exit 1; }
+            case "$CONFIRM_SHORT_SHA" in
+              *[!A-Za-z0-9]*) echo "::error::confirm-short-sha must be alphanumeric (got '${CONFIRM_SHORT_SHA}')"; exit 1 ;;
+            esac
+            case "$IMAGE_DIGEST" in
+              sha256:*) ;;
+              *) echo "::error::image-digest must be a sha256 image digest (got '${IMAGE_DIGEST}')"; exit 1 ;;
+            esac
+            case "${IMAGE_DIGEST#sha256:}" in
+              ''|*[!0-9a-f]*) echo "::error::image-digest must be a sha256 image digest (got '${IMAGE_DIGEST}')"; exit 1 ;;
+            esac
+          else
+            case "$SHA" in
+              ''|*[!A-Za-z0-9]*) echo "::error::the candidate host reports an unusable sha ('${SHA}')"; exit 1 ;;
+            esac
+          fi
 
           # Fetched and checksum-verified exactly like the host script, and
           # for the same reason: it is a program, so it lives in a file a test
           # can execute rather than in shell buried in YAML.
           script="$(mktemp)"
-          trap 'rm -f "$script"' EXIT
+          copied="$(mktemp)"
+          trap 'rm -f "$script" "$copied"' EXIT
           curl -fsSL "${SCRIPTS_BASE_URL}/scripts/copy-image.sh" -o "$script"
           echo "${CHURNER_COPY_SCRIPT_SHA256}  ${script}" | sha256sum -c -
 
-          CHURNER_SOURCE_REPOSITORY="$SOURCE_REPO" \
-          CHURNER_SOURCE_TAG="$SOURCE_TAG" \
-          CHURNER_TARGET_REPOSITORY="$TARGET_REPO" \
-          CHURNER_TARGET_TAG="$target_tag" \
-          bash "$script"
+          if [ -n "$IMAGE_DIGEST" ]; then
+            # The script refuses, before it writes anything, unless the
+            # image's revision label is a whole commit beginning with the
+            # confirmed one; the tag ends in that whole commit.
+            CHURNER_SOURCE_REPOSITORY="$SOURCE_REPO" \
+            CHURNER_SOURCE_DIGEST="$IMAGE_DIGEST" \
+            CHURNER_EXPECT_REVISION="$(printf '%s' "$CONFIRM_SHORT_SHA" | tr '[:upper:]' '[:lower:]')" \
+            CHURNER_TARGET_REPOSITORY="$TARGET_REPO" \
+            CHURNER_TARGET_TAG_PREFIX=prod- \
+            bash "$script" | tee "$copied"
+            sha="$(sed -n 's/^\[churner-image-copy\] churner-image-revision: //p' "$copied" | head -n 1)"
+            # Checked again where it enters this job's outputs: it lands in
+            # the production deploy's root-run command.
+            case "$sha" in
+              ''|*[!0-9a-f]*) echo "::error::the copy reported an unusable commit ('${sha}')"; exit 1 ;;
+            esac
+          else
+            sha="$SHA"
+            CHURNER_SOURCE_REPOSITORY="$SOURCE_REPO" \
+            CHURNER_SOURCE_TAG="$SOURCE_TAG" \
+            CHURNER_TARGET_REPOSITORY="$TARGET_REPO" \
+            CHURNER_TARGET_TAG="prod-${sha}" \
+            bash "$script"
+          fi
 
-          echo "tag=${target_tag}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=prod-${sha}"
+            echo "sha=${sha}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Tell Churner (promote)
         if: success()
@@ -884,7 +952,7 @@ jobs:
           TRACKER_TOKEN: ${{ secrets.tracker-token }}
           TRACKER_URL: ${{ inputs.tracker-url }}
           PROJECT: ${{ inputs.project }}
-          GIT_SHA: ${{ steps.running.outputs.running-sha }}
+          GIT_SHA: ${{ steps.copy.outputs.sha }}
           IMAGE_TAG: ${{ steps.copy.outputs.tag }}
           ACTOR: ${{ github.actor }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -955,7 +1023,7 @@ jobs:
           AWS_REGION: ${{ inputs.aws-region }}
           REPO: ${{ steps.ids.outputs.repo }}
           TAG: ${{ steps.copy.outputs.tag }}
-          SHA: ${{ steps.running.outputs.running-sha }}
+          SHA: ${{ steps.copy.outputs.sha }}
           HEALTH_PATH: ${{ inputs.health-path }}
           SECRET_KEYS: ${{ inputs.secret-keys }}
           DB_SECRET_ARN: ${{ inputs.db-secret-arn }}
@@ -1077,7 +1145,7 @@ jobs:
           TRACKER_TOKEN: ${{ secrets.tracker-token }}
           TRACKER_URL: ${{ inputs.tracker-url }}
           PROJECT: ${{ inputs.project }}
-          GIT_SHA: ${{ steps.running.outputs.running-sha }}
+          GIT_SHA: ${{ steps.copy.outputs.sha }}
           IMAGE_TAG: ${{ steps.copy.outputs.tag }}
           ACTOR: ${{ github.actor }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

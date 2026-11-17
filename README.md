@@ -30,27 +30,32 @@ on:
         description: promote only
         required: false
         default: ''
+      image-digest:
+        description: promote only, optional — sha256:<64 hex> of the image to promote
+        required: false
+        default: ''
 
 jobs:
   release:
     permissions:
       id-token: write     # mint the OIDC assertion for the deployer roles
       contents: read
-    uses: churner-ai/release-workflow/.github/workflows/release.yml@v1.4
+    uses: churner-ai/release-workflow/.github/workflows/release.yml@v1.5
     with:
-      project: MC
+      project: ACME
       action: ${{ inputs.action }}
       target-tag: ${{ inputs.target-tag }}
       confirm-short-sha: ${{ inputs.confirm-short-sha }}
+      image-digest: ${{ inputs.image-digest }}
       aws-region: us-east-2
 
       environment: production
-      role-arn: arn:aws:iam::111122223333:role/churner-deployer-mc-production
+      role-arn: arn:aws:iam::111122223333:role/churner-deployer-acme-production
       db-secret-arn: arn:aws:secretsmanager:us-east-2:111122223333:secret:rds!db-1111
 
       rc-environment: rc
-      rc-role-arn: arn:aws:iam::111122223333:role/churner-deployer-mc-rc
-      rc-codebuild-project: churner-mc-rc
+      rc-role-arn: arn:aws:iam::111122223333:role/churner-deployer-acme-rc
+      rc-codebuild-project: churner-acme-rc
       rc-db-secret-arn: arn:aws:secretsmanager:us-east-2:111122223333:secret:rds!db-2222
 
       # One list serves both: the candidate resolves the same NAMES under its
@@ -107,6 +112,18 @@ databases, registries and deployer roles (design spec §7.2/§7.4).
   manifest's layers exist in the repository it is written to, so a
   manifest-only retag cannot cross two repositories. Rebuilding from the same
   commit would have been simpler and would promote a *different* artefact.
+  Given `image-digest`, it promotes **that image** out of the candidate's
+  repository instead — the build a release check judged, whether or not the
+  candidate runs it now — and asks the candidate host nothing. A digest names
+  bytes, not a commit, so the copy first reads the image's own
+  `org.opencontainers.image.revision` label (every platform's, for a
+  multi-architecture index) and refuses, before anything is written, unless it
+  is a whole commit beginning with `confirm-short-sha`; production's tag is
+  `prod-<that whole commit>`. An image built without the label is refused.
+  The environment's own build stamps it: `cut-rc` starts its CodeBuild
+  project with `GIT_SHA` set to the commit it builds, and the buildspec
+  labels the image with it. A build started without it is labelled with the
+  project's placeholder, `unset`, which no promote by digest accepts.
 - **`rollback`**, given a `target-tag`, redeploys it on the production host.
   Left empty, it runs the `list` job instead: no deploy, just the available
   rollback points printed to the run summary.
@@ -129,7 +146,7 @@ new AWS grant.
 
 | Input | Required | Default | Meaning |
 |---|---|---|---|
-| `project` | yes | — | Churner project key, e.g. `MC`. |
+| `project` | yes | — | Churner project key, e.g. `ACME`. |
 | `action` | yes | — | `cut-rc`, `promote`, or `rollback`. |
 | `aws-region` | yes | — | Region both environment stacks live in. |
 | `environment` | no | `production` | The PRODUCTION environment's name, as you named it in the wizard. Also the GitHub environment whose protection rules gate `promote`/`rollback`. |
@@ -145,11 +162,12 @@ new AWS grant.
 | `rc-secret-keys` | no | `''` | The same, for the CANDIDATE container. **Leave it empty and the candidate gets `secret-keys`** — the same names, under rc's own prefix. Set it only for the asymmetric case. |
 | `image-tag` | no | `''` | Override for the tag `cut-rc` builds under. Leave empty — the default is `rc-<sha>`. |
 | `sha` | no | `''` | Commit to build (`cut-rc`). Leave empty to use this run's own ref head. |
-| `confirm-short-sha` | no | `''` | `promote` only, and required for it. The 7-character prefix of the commit you mean to promote, checked against what is ACTUALLY running on the candidate. |
+| `confirm-short-sha` | no | `''` | `promote` only, and required for it. The 7-character prefix of the commit you mean to promote, checked against what is ACTUALLY running on the candidate — or, with `image-digest`, against that image's revision label. |
+| `image-digest` | no | `''` | `promote` only. The `sha256:…` digest of the image in the candidate's repository to promote. Given it, the promote copies exactly that image and refuses unless its `org.opencontainers.image.revision` label is the commit `confirm-short-sha` names; the candidate host is not asked what it runs. Leave empty to promote what the candidate runs now. |
 | `target-tag` | no | `''` | `rollback` only. The tag to redeploy. Leave EMPTY to run the `list` job instead. |
 | `health-path` | no | `/` | Rooted path the readiness gate polls on the candidate release's own port before it is swapped live. |
 | `tracker-url` | no | `https://churner.ai` | Base URL of your Churner instance. https only. |
-| `scripts-base-url` | no | `churner-ai/environment-stack` @ `refs/tags/v1.2` | Where `host/deploy-release.sh` and `scripts/copy-image.sh` are fetched from — the SAME base URL the environment host's own `bootstrap.sh` uses. Tags are immutable once published. |
+| `scripts-base-url` | no | `churner-ai/environment-stack` @ `refs/tags/v1.4` | Where `host/deploy-release.sh` and `scripts/copy-image.sh` are fetched from — the SAME base URL the environment host's own `bootstrap.sh` uses. Tags are immutable once published. |
 
 | Secret | Required | Meaning |
 |---|---|---|
