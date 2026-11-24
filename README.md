@@ -40,7 +40,7 @@ jobs:
     permissions:
       id-token: write     # mint the OIDC assertion for the deployer roles
       contents: read
-    uses: churner-ai/release-workflow/.github/workflows/release.yml@v1.5
+    uses: churner-ai/release-workflow/.github/workflows/release.yml@v1.6
     with:
       project: ACME
       action: ${{ inputs.action }}
@@ -103,7 +103,13 @@ databases, registries and deployer roles (design spec §7.2/§7.4).
   It needs a stack applied since the bucket existed: Churner moves a
   repository onto `@v1.4` only once the stack reports it, and an upload that
   finds none fails with one line saying to apply the stack update. Production
-  is untouched, and this job's credentials cannot reach it.
+  is untouched, and this job's credentials cannot reach it. A build that
+  fails is classified from the tail of its own log stream (the one the build
+  names): a build step killed for memory (exit code 137, or a trailing
+  `Killed` line) fails the job saying the build ran out of memory at its
+  compute type and to raise `"size"` in `.churner/image-build.json` above it;
+  any other failure reads `CodeBuild finished <status>`, and a log that cannot
+  be read says so beside the status.
 - **`promote`** reads what is CURRENTLY RUNNING on the candidate host,
   refuses unless its short sha matches `confirm-short-sha`, **copies that
   exact image** into production's repository as `prod-<sha>`, and deploys it
@@ -257,6 +263,7 @@ deployer role grants, and nothing more
 ```
 s3:PutObject (build-contexts/* of rc's bucket)       upload the commit        (rc role)
 codebuild:StartBuild / codebuild:BatchGetBuilds     cut-rc's build           (rc role)
+logs:GetLogEvents (rc's own build log group)        a failed build's log     (rc role)
 ssm:DescribeInstanceInformation                     find a host by tag       (both)
 ssm:SendCommand / ssm:GetCommandInvocation          run the host script      (both)
 ecr:BatchGetImage / GetDownloadUrlForLayer          read rc's image          (prod role, on rc's repo)

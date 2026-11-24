@@ -6,4 +6,4 @@ Do not patch them here: the next release overwrites them.
 - `.github/workflows/release.yml` from `github-actions/release-workflow/workflow.yml`
 - `README.md` from `github-actions/release-workflow/README.md`
 
-Published as `v1.5` by Churner's production server from monorepo commit `4f5621a69c53`.
+Published as `v1.6` by Churner's production server from monorepo commit `7ac4fc70c806`.
